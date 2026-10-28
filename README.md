@@ -13,16 +13,28 @@ python -m pip install -r scripts/rabies_gui_requirements.txt
 python scripts/rabies_subject_manager.py
 ```
 
-Project root and original BIDS folder are intentionally not hard-coded. Use
-**Browse…** beside Project root, then choose the BIDS folder from the
-**Original BIDS folder (og_folder)** dropdown. The dropdown lists direct
-subfolders of the project root that contain `sub-*` subject folders; the BIDS
-folder does not have to be named `og_bids`. Choosing a project root fills the
-output and results paths with `<project root>/rabies_output/` and
+The GUI opens in the **RABIES Project Setup** window. Browse to the project
+root, output directory, results directory, RABIES image, and template folder
+(rat, mouse, or custom). Choosing a project root fills the output and results
+paths with `<project root>/rabies_output/` and
 `<project root>/rabies_results/`; edit those fields afterward if needed.
-Refresh the subject list after selecting the BIDS folder. The table shows BOLD
-and T2w scan counts and the status of preprocessing, confound correction, and
-analysis.
+
+Set **Subject folder prefix** to the leading text shared by subject directory
+names. It defaults to `sub-` (for example, `sub-001`); change it to `mouse-`,
+`participant-`, or the appropriate prefix for your dataset. This setting
+filters both the BIDS-folder dropdown and the subjects shown in the manager.
+The prefix must not be empty or contain path separators.
+
+Choose the original BIDS folder from the dropdown, which lists direct
+subfolders of the project root containing folders matching the subject prefix,
+or use its **Browse…** button to select another BIDS folder. The BIDS folder
+does not have to be named `og_bids`. Select **Open subject manager** to move
+to the separate subject window. Use **Project setup…** there to return to the
+setup window and apply different paths.
+
+The subject window contains the subject table, stage status, script controls,
+cleanup actions, and cleaned-timeseries tools. It shows BOLD and T2w scan
+counts and the status of preprocessing, confound correction, and analysis.
 
 Stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. RABIES writes this workflow pickle after a
@@ -79,7 +91,42 @@ into the shared `<results>/cleaned_timeseries/` folder. This action moves
 files (it does not copy them), keeps their filenames, and skips files when a
 destination with the same name already exists.
 
-Each generated job expects the same per-subject inputs and options as the
-example pipeline: `*_bold.nii.gz` and `*_T2w.nii.gz` files, the SIGMA rat
-template layout, and RABIES 0.6.3. Review the generated scripts before
-submission if your data layout or processing options differ.
+Each generated job expects per-subject `*_bold.nii.gz` and `*_T2w.nii.gz`
+files and RABIES 0.6.3. The default stage arguments use the SIGMA rat template
+layout. When selecting mouse or custom templates, use **RABIES arguments…** in
+the subject window to set the corresponding template and atlas file paths, and
+review the generated scripts before submission.
+
+# Setting up the work environment
+
+## Organizing the template folder
+
+The selected template-folder path is bind-mounted inside each Apptainer job as
+`/templates`. The default GUI arguments expect the SIGMA rat template files in
+this layout:
+
+```text
+rat_templates/
+├── anatomy/
+│   ├── SIGMA_InVivo_Brain_Template.nii.gz
+│   ├── SIGMA_InVivo_Brain_Mask.nii.gz
+│   ├── SIGMA_InVivo_WM_bin.nii.gz
+│   └── SIGMA_InVivo_CSF_bin.nii.gz
+├── atlas/
+│   └── SIGMA_Anatomical_Brain_Atlas.nii.gz
+└── canica_resting_state.nii.gz
+```
+
+For example, selecting `/project/templates/rat_templates` makes
+`/project/templates/rat_templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz`
+available to the container as
+`/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz`. Keep the expected
+relative paths and filenames, or edit the corresponding paths in
+**RABIES arguments…** before creating scripts.
+
+Mouse and custom templates can use a different organization. Select their
+containing folder in Project Setup, then update the preprocessing arguments
+(`--anat_template`, `--brain_mask`, `--WM_mask`, `--CSF_mask`, and
+`--vascular_mask`) and analysis arguments (`--ROI_labels_file` and
+`--prior_maps`) to point to the files in that folder. Those paths are resolved
+inside the container, so use `/templates/...` paths in the argument editor.
