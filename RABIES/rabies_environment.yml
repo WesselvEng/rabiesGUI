@@ -1,0 +1,30 @@
+name: rabies
+channels:
+  - conda-forge
+  - simpleitk
+  - https://fsl.fmrib.ox.ac.uk/fsldownloads/fslconda/public/
+dependencies:
+  - python=3.9
+  - pip>=23.0
+  - future
+  - matplotlib=3.3.4
+  - nibabel=3.2.1
+  - nipype=1.10.0
+  - numpy=1.26.4
+  - pandas=1.2.4
+  - pathos=0.2.7
+  - pybids=0.16.3
+  - scikit-learn=1.6.1
+  - scikit-image=0.19.3
+  - scipy=1.13.1
+  - seaborn=0.11.1
+  - simpleitk=2.5.0
+  - networkx<3
+  - fsl-base=2309.1
+  - fsl-melodic=2111.3
+  - traits<7.0
+  - tqdm
+  - git # necessary for installing the simpleitk_timeseries_motion_correction package from GitHub
+  - pip:
+      - qbatch==2.3
+      - simpleitk_timeseries_motion_correction @ git+https://github.com/Gab-D-G/simpleitk_timeseries_motion_correction@8cc2b031c22df5cf8d01f75ec186570dd3ffb3e9
