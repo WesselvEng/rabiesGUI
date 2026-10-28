@@ -171,14 +171,33 @@ def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str,
     }
 
 
-def discover_subjects(bids_dir: Path) -> list[tuple[str, int, int]]:
+def _validate_subject_prefix(subject_prefix: str) -> str:
+    if not subject_prefix or subject_prefix in {".", ".."}:
+        raise ValueError("Subject prefix must not be empty, '.' or '..'.")
+    if "/" in subject_prefix or "\\" in subject_prefix:
+        raise ValueError("Subject prefix must not contain path separators.")
+    return subject_prefix
+
+
+def _contains_subjects(directory: Path, subject_prefix: str) -> bool:
+    subject_prefix = _validate_subject_prefix(subject_prefix)
+    return any(
+        entry.is_dir() and entry.name.startswith(subject_prefix)
+        for entry in directory.iterdir()
+    )
+
+
+def discover_subjects(
+    bids_dir: Path, subject_prefix: str = "sub-"
+) -> list[tuple[str, int, int]]:
     """Return subject IDs and their BOLD/T2w file counts."""
     if not bids_dir.is_dir():
         raise FileNotFoundError(f"BIDS directory does not exist: {bids_dir}")
+    subject_prefix = _validate_subject_prefix(subject_prefix)
 
     subjects = []
-    for subject_dir in sorted(bids_dir.glob("sub-*")):
-        if not subject_dir.is_dir():
+    for subject_dir in sorted(bids_dir.iterdir()):
+        if not subject_dir.is_dir() or not subject_dir.name.startswith(subject_prefix):
             continue
         bold_count = sum(1 for _ in subject_dir.rglob("*_bold.nii.gz"))
         anat_count = sum(1 for _ in subject_dir.rglob("*_T2w.nii.gz"))
@@ -186,15 +205,16 @@ def discover_subjects(bids_dir: Path) -> list[tuple[str, int, int]]:
     return subjects
 
 
-def discover_bids_folders(root_dir: Path) -> list[Path]:
-    """Return immediate child folders of root_dir that contain sub-* folders."""
+def discover_bids_folders(root_dir: Path, subject_prefix: str = "sub-") -> list[Path]:
+    """Return immediate child folders containing subject folders with this prefix."""
     if not root_dir.is_dir():
         raise FileNotFoundError(f"Project root does not exist: {root_dir}")
+    subject_prefix = _validate_subject_prefix(subject_prefix)
     return sorted(
         folder
         for folder in root_dir.iterdir()
         if folder.is_dir()
-        and any(subject.is_dir() for subject in folder.glob("sub-*"))
+        and _contains_subjects(folder, subject_prefix)
     )
 
 
@@ -385,25 +405,23 @@ def generate_subject_script(
     return "\n".join(lines)
 
 
-class SubjectManager(QMainWindow):
+class ProjectSetupWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("RABIES Subject Manager")
-        self.resize(1180, 740)
-        self.setMinimumSize(900, 600)
+        self.setWindowTitle("RABIES Project Setup")
+        self.resize(820, 430)
+        self.setMinimumSize(720, 380)
         self.path_fields: dict[str, QLineEdit] = {}
-        self.stage_args = {
-            "Preprocessing": PREPROCESS_ARGS,
-            "Confound correction": CONFOUND_ARGS,
-            "Analysis": ANALYSIS_ARGS,
-        }
+        self.subject_manager: SubjectManager | None = None
         self._build_ui()
-        self.refresh_subjects()
 
     def _build_ui(self) -> None:
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
+        layout.addWidget(QLabel(
+            "Choose the project folders and template set, then continue to the subject manager."
+        ))
 
         paths = QWidget()
         path_layout = QFormLayout(paths)
@@ -411,24 +429,241 @@ class SubjectManager(QMainWindow):
             ("Project root", "root", ""),
             ("Output directory", "output", ""),
             ("Results directory", "results", ""),
-            ("Rat templates", "templates", DEFAULT_TEMPLATES),
+            ("Template folder (rat, mouse, or custom)", "templates", DEFAULT_TEMPLATES),
             ("RABIES image", "image", DEFAULT_RABIES_IMAGE),
+            ("Subject folder prefix", "subject_prefix", "sub-"),
         )
         for label, key, value in defaults:
             field = QLineEdit(value)
             self.path_fields[key] = field
+            if key == "subject_prefix":
+                field.textChanged.connect(self._populate_bids_folders)
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.addWidget(field)
-            browse = QPushButton("Browse…")
-            browse.clicked.connect(lambda _checked=False, item=key: self._browse(item))
-            row_layout.addWidget(browse)
+            if key != "subject_prefix":
+                browse = QPushButton("Browse…")
+                browse.clicked.connect(lambda _checked=False, item=key: self._browse(item))
+                row_layout.addWidget(browse)
             path_layout.addRow(label, row_widget)
+
         self.bids_folders = QComboBox()
         self.bids_folders.addItem("Select a folder containing sub-* subjects", None)
-        path_layout.addRow("Original BIDS folder (og_folder)", self.bids_folders)
+        bids_widget = QWidget()
+        bids_layout = QHBoxLayout(bids_widget)
+        bids_layout.setContentsMargins(0, 0, 0, 0)
+        bids_layout.addWidget(self.bids_folders)
+        browse_bids = QPushButton("Browse…")
+        browse_bids.clicked.connect(self._browse_bids_folder)
+        bids_layout.addWidget(browse_bids)
+        path_layout.addRow("Original BIDS folder (og_folder)", bids_widget)
         layout.addWidget(paths)
+        layout.addWidget(QLabel(
+            "For mouse or custom templates, check that the RABIES stage arguments "
+            "match the files in the selected template folder."
+        ))
+
+        controls = QHBoxLayout()
+        controls.addStretch()
+        open_manager = QPushButton("Open subject manager")
+        open_manager.clicked.connect(self.open_subject_manager)
+        controls.addWidget(open_manager)
+        layout.addLayout(controls)
+        self.status = QLabel("Select a project root and original BIDS folder.")
+        layout.addWidget(self.status)
+        self.path_fields["root"].textChanged.connect(self._populate_bids_folders)
+        self.path_fields["root"].editingFinished.connect(self._update_project_output_defaults)
+
+    def _browse(self, key: str) -> None:
+        if key == "image":
+            selected, _ = QFileDialog.getOpenFileName(self, "Select RABIES image")
+        else:
+            current_value = self.path_fields[key].text()
+            current_path = Path(current_value).expanduser() if current_value else Path.home()
+            dialog_title = "Select project root" if key == "root" else "Select directory"
+            selected = QFileDialog.getExistingDirectory(self, dialog_title, str(current_path))
+        if selected:
+            self.path_fields[key].setText(selected)
+            if key == "root":
+                self._populate_bids_folders()
+                self._update_project_output_defaults()
+
+    def _browse_bids_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "Select original BIDS folder",
+            self.path_fields["root"].text().strip() or str(Path.home()),
+        )
+        if not selected:
+            return
+        selected_path = Path(selected)
+        try:
+            subject_prefix = _validate_subject_prefix(
+                self.path_fields["subject_prefix"].text().strip()
+            )
+        except ValueError as error:
+            QMessageBox.critical(self, "Invalid subject prefix", str(error))
+            return
+        try:
+            has_subjects = _contains_subjects(selected_path, subject_prefix)
+        except OSError as error:
+            QMessageBox.critical(self, "Could not read BIDS folder", str(error))
+            return
+        if not has_subjects:
+            QMessageBox.critical(
+                self, "No BIDS subjects found",
+                f"No {subject_prefix}* subject folders were found in {selected_path}.",
+            )
+            return
+        for index in range(self.bids_folders.count()):
+            if self.bids_folders.itemData(index) == str(selected_path):
+                self.bids_folders.setCurrentIndex(index)
+                return
+        self.bids_folders.addItem(selected_path.name, str(selected_path))
+        self.bids_folders.setCurrentIndex(self.bids_folders.count() - 1)
+
+    def _populate_bids_folders(self) -> None:
+        root_value = self.path_fields["root"].text().strip()
+        previously_selected = self.bids_folders.currentData()
+        self.bids_folders.clear()
+        prefix = self.path_fields["subject_prefix"].text().strip()
+        self.bids_folders.addItem(
+            f"Select a folder containing {prefix or '<prefix>'}* subjects", None
+        )
+        if not root_value:
+            return
+        try:
+            subject_prefix = _validate_subject_prefix(prefix)
+            folders = discover_bids_folders(
+                Path(root_value).expanduser(), subject_prefix
+            )
+        except (OSError, ValueError) as error:
+            self.status.setText(str(error))
+            return
+        if not folders:
+            if (
+                previously_selected
+                and Path(previously_selected).is_dir()
+                and _contains_subjects(Path(previously_selected), subject_prefix)
+            ):
+                self.bids_folders.addItem(
+                    Path(previously_selected).name, previously_selected
+                )
+                self.bids_folders.setCurrentIndex(self.bids_folders.count() - 1)
+                return
+            self.status.setText(
+                f"No direct subfolders containing {subject_prefix}* subjects were found in {root_value}."
+            )
+            return
+        for folder in folders:
+            self.bids_folders.addItem(folder.name, str(folder))
+            if str(folder) == previously_selected:
+                self.bids_folders.setCurrentIndex(self.bids_folders.count() - 1)
+        if (
+            previously_selected
+            and Path(previously_selected).is_dir()
+            and all(str(folder) != previously_selected for folder in folders)
+            and _contains_subjects(Path(previously_selected), subject_prefix)
+        ):
+            self.bids_folders.addItem(
+                Path(previously_selected).name, previously_selected
+            )
+            self.bids_folders.setCurrentIndex(self.bids_folders.count() - 1)
+
+    def _selected_bids_dir(self) -> Path | None:
+        selected = self.bids_folders.currentData()
+        return Path(selected) if selected else None
+
+    def _update_project_output_defaults(self) -> None:
+        root_value = self.path_fields["root"].text().strip()
+        if not root_value:
+            return
+        root = Path(root_value).expanduser()
+        self.path_fields["output"].setText(str(root / "rabies_output"))
+        self.path_fields["results"].setText(str(root / "rabies_results"))
+
+    def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
+        root_value = self.path_fields["root"].text().strip()
+        return (
+            Path(root_value).expanduser() if root_value else Path(),
+            Path(self.path_fields["output"].text()).expanduser(),
+            Path(self.path_fields["results"].text()).expanduser(),
+            Path(self.path_fields["templates"].text()).expanduser(),
+            Path(self.path_fields["image"].text()).expanduser(),
+        )
+
+    def open_subject_manager(self) -> None:
+        root, output, results, _, _ = self._project_paths()
+        bids_dir = self._selected_bids_dir()
+        if not root.is_dir():
+            QMessageBox.critical(self, "Project root not found", f"Select an existing project root: {root}")
+            return
+        if bids_dir is None or not bids_dir.is_dir():
+            QMessageBox.critical(
+                self, "Original BIDS folder not set",
+                "Choose or browse to an existing original BIDS folder.",
+            )
+            return
+        try:
+            subject_prefix = _validate_subject_prefix(
+                self.path_fields["subject_prefix"].text().strip()
+            )
+        except ValueError as error:
+            QMessageBox.critical(self, "Invalid subject prefix", str(error))
+            return
+        if not self.path_fields["output"].text().strip() or not self.path_fields["results"].text().strip():
+            QMessageBox.critical(
+                self, "Output paths not set",
+                "Set both the output and results directories before continuing.",
+            )
+            return
+        try:
+            discover_subjects(bids_dir, subject_prefix)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Could not read BIDS subjects", str(error))
+            return
+
+        if self.subject_manager is None:
+            self.subject_manager = SubjectManager(self)
+        else:
+            self.subject_manager.refresh_subjects()
+            self.subject_manager.update_project_label()
+        self.hide()
+        self.subject_manager.show()
+        self.subject_manager.raise_()
+        self.subject_manager.activateWindow()
+
+
+class SubjectManager(QMainWindow):
+    def __init__(self, setup_window: ProjectSetupWindow) -> None:
+        super().__init__()
+        self.setup_window = setup_window
+        self.path_fields = setup_window.path_fields
+        self.bids_folders = setup_window.bids_folders
+        self.setWindowTitle("RABIES Subject Manager")
+        self.resize(1180, 740)
+        self.setMinimumSize(900, 600)
+        self.stage_args = {
+            "Preprocessing": PREPROCESS_ARGS,
+            "Confound correction": CONFOUND_ARGS,
+            "Analysis": ANALYSIS_ARGS,
+        }
+        self._build_ui()
+        self.update_project_label()
+        self.refresh_subjects()
+
+    def _build_ui(self) -> None:
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+
+        project_options = QHBoxLayout()
+        self.project_label = QLabel()
+        project_options.addWidget(self.project_label, 1)
+        project_settings = QPushButton("Project setup…")
+        project_settings.clicked.connect(self.show_project_setup)
+        project_options.addWidget(project_settings)
+        layout.addLayout(project_options)
 
         self.subjects = QTableWidget(0, 6)
         self.subjects.setHorizontalHeaderLabels(
@@ -485,69 +720,29 @@ class SubjectManager(QMainWindow):
         cleanup_options.addStretch()
         layout.addLayout(cleanup_options)
 
-        self.status = QLabel(
-            "Choose a project root, select its original BIDS folder, then refresh subjects."
-        )
+        self.status = QLabel("Select subjects to create or submit jobs.")
         layout.addWidget(self.status)
-        self.path_fields["root"].textChanged.connect(self._populate_bids_folders)
-        self.path_fields["root"].editingFinished.connect(self._update_project_output_defaults)
-
-    def _browse(self, key: str) -> None:
-        if key == "image":
-            selected, _ = QFileDialog.getOpenFileName(self, "Select RABIES image")
-        else:
-            current_value = self.path_fields[key].text()
-            current_path = Path(current_value).expanduser() if current_value else Path.home()
-            dialog_title = "Select project root" if key == "root" else "Select directory"
-            selected = QFileDialog.getExistingDirectory(
-                self, dialog_title, str(current_path),
-            )
-        if selected:
-            self.path_fields[key].setText(selected)
-            if key == "root":
-                self._populate_bids_folders()
-                self._update_project_output_defaults()
-
-    def _populate_bids_folders(self) -> None:
-        root_value = self.path_fields["root"].text().strip()
-        self.bids_folders.clear()
-        self.bids_folders.addItem("Select a folder containing sub-* subjects", None)
-        if not root_value:
-            return
-        try:
-            folders = discover_bids_folders(Path(root_value).expanduser())
-        except OSError as error:
-            self.status.setText(str(error))
-            return
-        if not folders:
-            self.status.setText(
-                f"No direct subfolders containing sub-* subjects were found in {root_value}."
-            )
-            return
-        for folder in folders:
-            self.bids_folders.addItem(folder.name, str(folder))
-
-    def _selected_bids_dir(self) -> Path | None:
-        selected = self.bids_folders.currentData()
-        return Path(selected) if selected else None
-
-    def _update_project_output_defaults(self) -> None:
-        root_value = self.path_fields["root"].text().strip()
-        if not root_value:
-            return
-        root = Path(root_value).expanduser()
-        self.path_fields["output"].setText(str(root / "rabies_output"))
-        self.path_fields["results"].setText(str(root / "rabies_results"))
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
-        root_value = self.path_fields["root"].text().strip()
-        return (
-            Path(root_value).expanduser() if root_value else Path(),
-            Path(self.path_fields["output"].text()).expanduser(),
-            Path(self.path_fields["results"].text()).expanduser(),
-            Path(self.path_fields["templates"].text()).expanduser(),
-            Path(self.path_fields["image"].text()).expanduser(),
+        return self.setup_window._project_paths()
+
+    def _selected_bids_dir(self) -> Path | None:
+        return self.setup_window._selected_bids_dir()
+
+    def update_project_label(self) -> None:
+        root, output, results, templates, image = self._project_paths()
+        bids = self._selected_bids_dir()
+        self.project_label.setText(
+            f"Project: {root}  |  BIDS: {bids or 'not selected'}  |  "
+            f"Templates: {templates}  |  Output: {output}  |  Results: {results}  |  "
+            f"RABIES: {image}"
         )
+
+    def show_project_setup(self) -> None:
+        self.hide()
+        self.setup_window.show()
+        self.setup_window.raise_()
+        self.setup_window.activateWindow()
 
     def refresh_subjects(self) -> None:
         if not self.path_fields["root"].text().strip():
@@ -555,14 +750,20 @@ class SubjectManager(QMainWindow):
             return
         bids_dir = self._selected_bids_dir()
         if bids_dir is None:
-            self.status.setText("Select the original BIDS folder containing sub-* subjects.")
+            prefix = self.path_fields["subject_prefix"].text().strip() or "<prefix>"
+            self.status.setText(
+                f"Select the original BIDS folder containing {prefix}* subjects."
+            )
             return
         if not self.path_fields["output"].text().strip() or not self.path_fields["results"].text().strip():
             self.status.setText("Choose a project root or enter output and results directories.")
             return
         try:
             _, output, results, _, _ = self._project_paths()
-            discovered = discover_subjects(bids_dir)
+            subject_prefix = _validate_subject_prefix(
+                self.path_fields["subject_prefix"].text().strip()
+            )
+            discovered = discover_subjects(bids_dir, subject_prefix)
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Could not read subjects", str(error))
             return
@@ -952,6 +1153,6 @@ class SubjectManager(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication([])
-    window = SubjectManager()
+    window = ProjectSetupWindow()
     window.show()
     app.exec()

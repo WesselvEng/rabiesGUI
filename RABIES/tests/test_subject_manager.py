@@ -44,6 +44,30 @@ class SubjectManagerTests(unittest.TestCase):
                 [("sub-002", 1, 0)],
             )
 
+    def test_subject_prefix_can_be_changed_for_subject_and_bids_folder_discovery(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bids = root / "raw_data"
+            subject = bids / "mouse-001"
+            (subject / "func").mkdir(parents=True)
+            (subject / "func" / "mouse-001_bold.nii.gz").touch()
+            (bids / "sub-ignored").mkdir()
+
+            self.assertEqual(
+                discover_subjects(bids, "mouse-"),
+                [("mouse-001", 1, 0)],
+            )
+            self.assertEqual(discover_bids_folders(root, "mouse-"), [bids])
+
+    def test_subject_prefix_must_be_a_nonempty_folder_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            for prefix in ("", ".", "..", "sub/"):
+                with self.subTest(prefix=prefix):
+                    with self.assertRaises(ValueError):
+                        discover_subjects(root, prefix)
+
     def test_root_folder_choices_only_include_directories_with_subjects(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
