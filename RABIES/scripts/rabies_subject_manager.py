@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browse BIDS subjects and generate/submit per-subject RABIES jobs."""
+"""Browse BIDS subjects and generate/submit cohort-wide RABIES jobs."""
 
 from __future__ import annotations
 
@@ -37,8 +37,8 @@ from PySide6.QtWidgets import (
 )
 
 
-DEFAULT_RABIES_IMAGE = "/opt/rabies/0.6.3/rabies.sif"
-DEFAULT_TEMPLATES = "/project/4180000.74/wessel/templates/rat_templates"
+DEFAULT_RABIES_IMAGE = ""
+DEFAULT_TEMPLATES = ""
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -173,6 +173,18 @@ def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str,
         "preprocess": any(path.is_file() for path in preprocess_candidates),
         "confound": any(path.is_file() for path in confound_candidates),
         "analysis": any(path.is_file() for path in analysis_candidates),
+    }
+
+
+def cohort_stage_status(results_dir: Path) -> dict[str, bool]:
+    """Report completion markers for the shared full-dataset RABIES run."""
+    cohort_dir = results_dir / "cohort"
+    return {
+        "preprocess": _workflow_path(cohort_dir / "preprocess", "preprocess").is_file(),
+        "confound": _workflow_path(
+            cohort_dir / "confound", "confound_correction"
+        ).is_file(),
+        "analysis": _workflow_path(cohort_dir / "analysis", "analysis").is_file(),
     }
 
 
@@ -382,30 +394,38 @@ def discover_bids_folders(root_dir: Path, subject_prefix: str = "sub-") -> list[
     )
 
 
-def move_cleaned_timeseries(subjects: list[str], results_dir: Path) -> tuple[list[Path], list[Path]]:
+def move_cleaned_timeseries(
+    subjects: list[str], results_dir: Path
+) -> tuple[list[Path], list[Path]]:
     """Move selected subjects' cleaned NIfTI files into a shared results folder."""
     destination_dir = results_dir / "cleaned_timeseries"
     moved: list[Path] = []
     skipped: list[Path] = []
 
+    source_dirs = [
+        results_dir / "cohort" / "confound" / "confound_correction_datasink"
+        / "cleaned_timeseries"
+    ]
     for subject in subjects:
-        source_dir = (
-            results_dir
-            / subject
-            / "confound"
-            / "confound_correction_datasink"
+        source_dirs.append(
+            results_dir / subject / "confound" / "confound_correction_datasink"
             / "cleaned_timeseries"
         )
-        if not source_dir.is_dir():
+    sources = sorted(
+        source
+        for source_dir in source_dirs
+        if source_dir.is_dir()
+        for source in source_dir.rglob("*_cleaned.nii.gz")
+        if any(source.name.startswith(f"{subject}_") for subject in subjects)
+    )
+    for source in sources:
+        destination = destination_dir / source.name
+        if destination.exists():
+            skipped.append(source)
             continue
-        for source in sorted(source_dir.rglob("*_cleaned.nii.gz")):
-            destination = destination_dir / source.name
-            if destination.exists():
-                skipped.append(source)
-                continue
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source), str(destination))
-            moved.append(destination)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        moved.append(destination)
 
     return moved, skipped
 
@@ -418,6 +438,107 @@ def _expand_template_paths(arguments: str, templates: dict[str, str]) -> str:
     for name, path in templates.items():
         arguments = arguments.replace(f"{{{name}}}", path)
     return arguments
+
+
+def generate_cohort_script(
+    bids_dir: Path,
+    results_dir: Path,
+    templates_dir: Path,
+    rabies_image: Path,
+    preprocess_args: str = PREPROCESS_ARGS,
+    confound_args: str = CONFOUND_ARGS,
+    analysis_args: str = ANALYSIS_ARGS,
+) -> str:
+    """Build one resumable RABIES job for all subjects and sessions in a BIDS dataset."""
+    bids_dir = bids_dir.expanduser().resolve()
+    cohort_dir = (results_dir / "cohort").expanduser().resolve()
+    if bids_dir == cohort_dir or bids_dir in cohort_dir.parents:
+        raise ValueError(
+            "The cohort results directory must not be inside the input BIDS directory."
+        )
+    subjects = discover_subjects(bids_dir)
+    if not subjects:
+        raise ValueError(f"No BIDS subjects found in {bids_dir}.")
+
+    preprocess = cohort_dir / "preprocess"
+    confound = cohort_dir / "confound"
+    analysis = cohort_dir / "analysis"
+    archived_bids = cohort_dir / "input_bids"
+    templates = {
+        "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
+        "brain_mask": "/templates/anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
+        "WM_mask": "/templates/anatomy/SIGMA_InVivo_WM_bin.nii.gz",
+        "CSF_mask": "/templates/anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
+        "vascular_mask": "/templates/anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
+        "rois": "/templates/atlas/SIGMA_Anatomical_Brain_Atlas.nii.gz",
+        "priors": "/templates/canica_resting_state.nii.gz",
+    }
+
+    def bind(host_path: Path, container_path: str, read_only: bool = False) -> str:
+        suffix = ":ro" if read_only else ""
+        return f"{host_path}:{container_path}{suffix}"
+
+    command_base = ["apptainer", "run"]
+    preprocess_command = command_base + [
+        "-B", bind(archived_bids, "/input_bids", True),
+        "-B", bind(preprocess, "/preprocess_outputs"),
+        "-B", bind(templates_dir, "/templates", True),
+        str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
+        "preprocess",
+        "/input_bids/", "/preprocess_outputs/",
+    ] + shlex.split(_expand_template_paths(preprocess_args, templates))
+    confound_command = command_base + [
+        "-B", bind(preprocess, "/preprocess_outputs"),
+        "-B", bind(confound, "/confound_correction_outputs"),
+        "-B", bind(templates_dir, "/templates", True),
+        str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
+        "confound_correction",
+        "/preprocess_outputs/", "/confound_correction_outputs/",
+    ] + shlex.split(confound_args)
+    analysis_command = command_base + [
+        "-B", bind(preprocess, "/preprocess_outputs", True),
+        "-B", bind(confound, "/confound_correction_outputs"),
+        "-B", bind(analysis, "/analysis_outputs"),
+        "-B", bind(templates_dir, "/templates", True),
+        str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
+        "analysis",
+        "/confound_correction_outputs/", "/analysis_outputs/",
+    ] + shlex.split(_expand_template_paths(analysis_args, templates))
+
+    preprocess_workflow = _workflow_path(preprocess, "preprocess")
+    confound_workflow = _workflow_path(confound, "confound_correction")
+    analysis_workflow = _workflow_path(analysis, "analysis")
+    return "\n".join([
+        "#!/usr/bin/env bash",
+        "#SBATCH --time=24:00:00",
+        "#SBATCH --mem=16G",
+        "#SBATCH --cpus-per-task=8",
+        "set -euo pipefail",
+        f"cohort={shlex.quote(str(cohort_dir))}",
+        f"preprocess={shlex.quote(str(preprocess))}",
+        f"confound={shlex.quote(str(confound))}",
+        f"analysis={shlex.quote(str(analysis))}",
+        f"bids_source={shlex.quote(str(bids_dir))}",
+        f"archived_bids={shlex.quote(str(archived_bids))}",
+        'mkdir -p "$cohort" "$preprocess" "$confound" "$analysis"',
+        'if [[ ! -d "$archived_bids" ]]; then',
+        '  bids_staging=$(mktemp -d "$cohort/.input_bids.XXXXXX")',
+        '  cp -a "$bids_source/." "$bids_staging/"',
+        '  mv "$bids_staging" "$archived_bids"',
+        "fi",
+        f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {archived_bids}')}",
+        f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+        "  " + _shell_command(preprocess_command),
+        "fi",
+        f"if [[ ! -f {shlex.quote(str(confound_workflow))} ]]; then",
+        "  " + _shell_command(confound_command),
+        "fi",
+        f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
+        "  " + _shell_command(analysis_command),
+        "fi",
+        'echo "Finished cohort analysis"',
+        "",
+    ])
 
 
 def _session_name(path: Path, subject: str) -> str | None:
@@ -858,7 +979,10 @@ class SubjectManager(QMainWindow):
 
         self.subjects = QTableWidget(0, 6)
         self.subjects.setHorizontalHeaderLabels(
-            ["Subject", "BOLD scans", "T2w scans", "Preprocess", "Confound", "Analysis"]
+            [
+                "Subject", "BOLD scans", "T2w scans",
+                "Cohort preprocess", "Cohort confound", "Cohort analysis",
+            ]
         )
         self.subjects.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.subjects.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -876,7 +1000,7 @@ class SubjectManager(QMainWindow):
         self.session_details.setHorizontalHeaderLabels([
             "Session",
             "NIfTI orientations",
-            "Session archive",
+            "Session input",
             "Subject preprocess",
             "Subject confound",
             "Subject analysis",
@@ -900,7 +1024,7 @@ class SubjectManager(QMainWindow):
             ("Refresh subjects", self.refresh_subjects),
             ("Select all", self.select_all),
             ("Clear selection", self.clear_selection),
-            ("Remove selected scripts", self.remove_scripts),
+            ("Remove cohort script", self.remove_scripts),
             ("Move cleaned timeseries", self.move_selected_cleaned_timeseries),
         ):
             button = QPushButton(label)
@@ -909,9 +1033,9 @@ class SubjectManager(QMainWindow):
         options.addStretch()
         for label, callback in (
             ("RABIES arguments…", self.edit_arguments),
-            ("Create scripts", self.create_scripts),
+            ("Create cohort script", self.create_scripts),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
-            ("Submit scripts with sbatch", self.submit_scripts),
+            ("Submit cohort with sbatch", self.submit_scripts),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
@@ -938,7 +1062,9 @@ class SubjectManager(QMainWindow):
         cleanup_options.addStretch()
         layout.addLayout(cleanup_options)
 
-        self.status = QLabel("Select subjects to create or submit jobs.")
+        self.status = QLabel(
+            "Create or submit one RABIES job for all subjects in the selected BIDS folder."
+        )
         layout.addWidget(self.status)
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
@@ -977,7 +1103,7 @@ class SubjectManager(QMainWindow):
             self.status.setText("Choose a project root or enter output and results directories.")
             return
         try:
-            _, output, results, _, _ = self._project_paths()
+            _, _, results, _, _ = self._project_paths()
             subject_prefix = _validate_subject_prefix(
                 self.path_fields["subject_prefix"].text().strip()
             )
@@ -990,7 +1116,7 @@ class SubjectManager(QMainWindow):
         try:
             self.subjects.setRowCount(len(discovered))
             for row, (subject, bold_count, anat_count) in enumerate(discovered):
-                states = stage_status(subject, output, results)
+                states = cohort_stage_status(results)
                 previous_results = subject_has_previous_results(subject, results)
                 values = (
                     subject,
@@ -998,8 +1124,8 @@ class SubjectManager(QMainWindow):
                     str(anat_count),
                     "Complete" if states["preprocess"] else "Not found",
                     "Complete" if states["confound"] else "Not found",
-                    "Existing output (clear to rerun)" if previous_results else (
-                        "Complete" if states["analysis"] else "Not found"
+                    "Complete" if states["analysis"] else (
+                        "Legacy output" if previous_results else "Not found"
                     ),
                 )
                 for column, value in enumerate(values):
@@ -1026,7 +1152,7 @@ class SubjectManager(QMainWindow):
             return
 
         subject = subject_item.text()
-        _, output, results, _, _ = self._project_paths()
+        _, _, results, _, _ = self._project_paths()
         try:
             sessions = session_nifti_orientations(bids_dir / subject)
         except OSError as error:
@@ -1034,7 +1160,7 @@ class SubjectManager(QMainWindow):
             return
         if not sessions:
             sessions = {"No session": []}
-        states = stage_status(subject, output, results)
+        states = cohort_stage_status(results)
         rows = [
             (session, path, orientation)
             for session, files in sessions.items()
@@ -1048,8 +1174,11 @@ class SubjectManager(QMainWindow):
                 "Not applicable"
                 if session == "No session"
                 else (
-                    "Present"
-                    if (results / subject / session).is_dir()
+                    "Available"
+                    if (
+                        results / "cohort" / "input_bids"
+                        / subject / session
+                    ).is_dir()
                     else "Not found"
                 )
             )
@@ -1071,7 +1200,7 @@ class SubjectManager(QMainWindow):
                     item.setToolTip(str(path.resolve()))
                 self.session_details.setItem(row, column, item)
         self.session_details_label.setText(
-            f"Sessions for {subject} (stage results are subject-wide):"
+            f"Sessions for {subject} (stage results are cohort-wide):"
         )
 
     def select_all(self) -> None:
@@ -1121,35 +1250,29 @@ class SubjectManager(QMainWindow):
             self.status.setText("RABIES arguments updated for future script generation.")
 
     def remove_scripts(self) -> None:
-        selected = self._selected_subjects()
-        if not selected:
-            QMessageBox.information(self, "No subjects selected", "Select subjects whose scripts you want to remove.")
-            return
         _, output, _, _, _ = self._project_paths()
         if not self.path_fields["output"].text().strip():
             QMessageBox.critical(self, "Output directory not set", "Choose a project root or set an output directory.")
             return
 
-        script_paths = [output / "tmp_script" / f"scrip_{subject}.sh" for subject in selected]
-        existing_paths = [path for path in script_paths if path.is_file()]
-        if not existing_paths:
-            QMessageBox.information(self, "No scripts found", "No generated scripts exist for the selected subjects.")
+        script_path = output / "tmp_script" / "scrip_cohort.sh"
+        if not script_path.is_file():
+            QMessageBox.information(self, "No script found", "No cohort script exists.")
             return
         answer = QMessageBox.question(
             self,
-            "Remove generated scripts",
-            f"Remove {len(existing_paths)} selected script(s)? This does not remove RABIES outputs.",
+            "Remove cohort script",
+            "Remove the generated cohort script? This does not remove RABIES outputs.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            for path in existing_paths:
-                path.unlink()
+            script_path.unlink()
         except OSError as error:
             QMessageBox.critical(self, "Could not remove scripts", str(error))
             return
-        self.status.setText(f"Removed {len(existing_paths)} generated script(s).")
+        self.status.setText("Removed the generated cohort script.")
 
     def clear_selected_results(self) -> None:
         selected = self._selected_subjects()
@@ -1173,6 +1296,14 @@ class SubjectManager(QMainWindow):
             )
             return
         results = Path(results_value).expanduser()
+        if subjects is not None and (results / "cohort").exists():
+            QMessageBox.information(
+                self,
+                "Cohort results cannot be cleared per subject",
+                "RABIES results are shared across the full BIDS dataset. "
+                "Use Clear ALL results to remove the cohort outputs.",
+            )
+            return
         if subjects is not None:
             targets = [results / subject for subject in subjects]
         else:
@@ -1315,6 +1446,16 @@ class SubjectManager(QMainWindow):
                 "Select an existing original BIDS folder before reorienting files.",
             )
             return
+        _, _, results, _, _ = self._project_paths()
+        if (results / "cohort" / "input_bids").is_dir():
+            QMessageBox.critical(
+                self,
+                "Clear cohort results before reorienting",
+                "This cohort already has an archived BIDS snapshot. Clear ALL results "
+                "before changing the input orientations, then reorient and create a "
+                "new cohort script.",
+            )
+            return
 
         candidates = []
         unreadable = []
@@ -1395,42 +1536,19 @@ class SubjectManager(QMainWindow):
         )
 
     def create_scripts(self) -> None:
-        selected = self._selected_subjects()
-        if not selected:
-            QMessageBox.information(self, "No subjects selected", "Select at least one subject first.")
-            return
         bids_dir = self._selected_bids_dir()
-        if bids_dir is None:
+        if bids_dir is None or not bids_dir.is_dir():
             QMessageBox.critical(
                 self, "Original BIDS folder not set",
-                "Select the original BIDS folder (og_folder) containing the sub-* folders.",
+                "Select an existing original BIDS folder before creating the cohort script.",
             )
             return
         _, output, results, templates, image = self._project_paths()
-        if not bids_dir.is_dir():
-            QMessageBox.critical(
-                self, "Original BIDS folder not found",
-                f"Select an existing original BIDS folder (og_folder): {bids_dir}",
-            )
-            return
         if not self.path_fields["output"].text().strip():
             QMessageBox.critical(self, "Output directory not set", "Select a project root or set an output directory.")
             return
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
-            return
-        blocked = [
-            subject for subject in selected
-            if subject_has_previous_results(subject, results)
-        ]
-        if blocked:
-            QMessageBox.critical(
-                self,
-                "Previous results must be cleared",
-                "Cannot create jobs for subjects with existing archived output:\n"
-                + "\n".join(blocked)
-                + "\nUse Clear selected results before rerunning them.",
-            )
             return
         if not templates.is_dir():
             QMessageBox.critical(self, "Templates not found", f"Template directory does not exist: {templates}")
@@ -1440,39 +1558,32 @@ class SubjectManager(QMainWindow):
             return
         script_dir = output / "tmp_script"
         try:
+            subject_count = len(discover_subjects(bids_dir))
             script_dir.mkdir(parents=True, exist_ok=True)
-            scripts = []
-            for subject in selected:
-                subject_dir = bids_dir / subject
-                bold_files = sorted(subject_dir.rglob("*_bold.nii.gz"))
-                anat_files = sorted(subject_dir.rglob("*_T2w.nii.gz"))
-                script = generate_subject_script(
-                    subject,
-                    bold_files,
-                    anat_files,
-                    output,
-                    results,
-                    templates,
-                    image,
-                    preprocess_args=self.stage_args["Preprocessing"],
-                    confound_args=self.stage_args["Confound correction"],
-                    analysis_args=self.stage_args["Analysis"],
-                )
-                scripts.append((script_dir / f"scrip_{subject}.sh", script))
-            for script_path, script in scripts:
-                script_path.write_text(script, encoding="utf-8")
-                script_path.chmod(0o755)
+            script = generate_cohort_script(
+                bids_dir,
+                results,
+                templates,
+                image,
+                preprocess_args=self.stage_args["Preprocessing"],
+                confound_args=self.stage_args["Confound correction"],
+                analysis_args=self.stage_args["Analysis"],
+            )
+            script_path = script_dir / "scrip_cohort.sh"
+            script_path.write_text(script, encoding="utf-8")
+            script_path.chmod(0o755)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
-        self.status.setText(f"Created {len(selected)} script(s) in {script_dir}.")
-        QMessageBox.information(self, "Scripts created", f"Created scripts for {len(selected)} subject(s).")
+        self.status.setText(
+            f"Created one cohort script for {subject_count} subject(s) in {script_dir}."
+        )
+        QMessageBox.information(
+            self, "Cohort script created",
+            f"Created {script_path} for {subject_count} subject(s).",
+        )
 
     def submit_scripts(self) -> None:
-        selected = self._selected_subjects()
-        if not selected:
-            QMessageBox.information(self, "No subjects selected", "Select at least one subject first.")
-            return
         _, output, results, _, _ = self._project_paths()
         bids_dir = self._selected_bids_dir()
         if bids_dir is None or not bids_dir.is_dir():
@@ -1487,8 +1598,29 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
+        orientation_source = results / "cohort" / "input_bids"
+        if not orientation_source.is_dir():
+            orientation_source = bids_dir
         try:
-            orientation_issues = nifti_orientation_issues(bids_dir, selected)
+            subjects = [
+                subject
+                for subject, _bold_count, _anat_count in discover_subjects(
+                    orientation_source
+                )
+            ]
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Could not read BIDS subjects", str(error))
+            return
+        if not subjects:
+            QMessageBox.critical(
+                self, "No BIDS subjects found",
+                f"No BIDS subjects were found in {bids_dir}.",
+            )
+            return
+        try:
+            orientation_issues = nifti_orientation_issues(
+                orientation_source, subjects
+            )
         except OSError as error:
             QMessageBox.critical(self, "Could not check NIfTI orientations", str(error))
             return
@@ -1501,43 +1633,52 @@ class SubjectManager(QMainWindow):
                 + "\n".join(orientation_issues),
             )
             return
-        blocked = [
-            subject for subject in selected
-            if subject_has_previous_results(subject, results)
-        ]
-        if blocked:
+        script_path = output / "tmp_script" / "scrip_cohort.sh"
+        if not script_path.is_file():
             QMessageBox.critical(
                 self,
-                "Previous results must be cleared",
-                "Cannot submit jobs for subjects with existing archived output:\n"
-                + "\n".join(blocked)
-                + "\nUse Clear selected results before rerunning them.",
+                "Cohort script not found",
+                "Create the cohort script first.",
             )
             return
-        script_paths = [output / "tmp_script" / f"scrip_{subject}.sh" for subject in selected]
-        missing = [str(path) for path in script_paths if not path.is_file()]
-        if missing:
+        try:
+            script_text = script_path.read_text(encoding="utf-8")
+        except OSError as error:
+            QMessageBox.critical(self, "Could not read cohort script", str(error))
+            return
+        expected_bids_source = (
+            f"bids_source={shlex.quote(str(bids_dir.expanduser().resolve()))}"
+        )
+        expected_cohort_dir = (
+            f"cohort={shlex.quote(str((results / 'cohort').expanduser().resolve()))}"
+        )
+        if (
+            expected_bids_source not in script_text
+            or expected_cohort_dir not in script_text
+        ):
             QMessageBox.critical(
                 self,
-                "Scripts not found",
-                "Create scripts for the selected subjects first:\n" + "\n".join(missing),
+                "Cohort script is out of date",
+                "The script was created for a different BIDS folder. "
+                "Create the cohort script again before submitting.",
             )
             return
         confirmation = QMessageBox.question(
             self,
-            "Submit jobs",
-            f"Submit {len(script_paths)} selected script(s) to SLURM with sbatch?",
+            "Submit cohort job",
+            f"Submit one RABIES job for all {len(subjects)} subject(s) in "
+            f"{bids_dir} with sbatch? The job archives the full BIDS dataset "
+            f"under {results / 'cohort' / 'input_bids'} before processing.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
         submitted = []
         try:
-            for path in script_paths:
-                result = subprocess.run(
-                    ["sbatch", str(path)], check=True, capture_output=True, text=True
-                )
-                submitted.append(result.stdout.strip() or str(path))
+            result = subprocess.run(
+                ["sbatch", str(script_path)], check=True, capture_output=True, text=True
+            )
+            submitted.append(result.stdout.strip() or str(script_path))
         except (OSError, subprocess.CalledProcessError) as error:
             details = getattr(error, "stderr", None) or str(error)
             QMessageBox.critical(

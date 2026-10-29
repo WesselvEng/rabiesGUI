@@ -1,0 +1,13 @@
+*
+!.gitignore
+!README.md
+!RABIES/
+
+RABIES/*
+!RABIES/LICENSE
+!RABIES/scripts/
+
+RABIES/scripts/*
+!RABIES/scripts/manager.py
+!RABIES/scripts/rabies_subject_manager.py
+!RABIES/scripts/rabies_gui_requirements.txt
