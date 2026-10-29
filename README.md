@@ -1,8 +1,8 @@
 # Manage subjects with the GUI
 
 `rabies_subject_manager.py` is a PySide6 application for viewing BIDS
-subjects, checking completed RABIES stages, and creating or submitting one
-SLURM job script per selected subject.
+subjects, checking NIfTI orientations and completed RABIES stages, and creating
+or submitting one SLURM job script per selected subject.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -35,6 +35,10 @@ setup window and apply different paths.
 The subject window contains the subject table, stage status, script controls,
 cleanup actions, and cleaned-timeseries tools. It shows BOLD and T2w scan
 counts and the status of preprocessing, confound correction, and analysis.
+Select a subject to view its sessions, every NIfTI's orientation, whether the
+session input archive is present, and the subject-wide stage results. Script
+creation is allowed regardless of orientation, but job submission is blocked
+if any BIDS NIfTI is unreadable or is not in RAS orientation.
 
 Stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. RABIES writes this workflow pickle after a

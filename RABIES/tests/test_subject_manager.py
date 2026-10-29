@@ -1,17 +1,28 @@
+import os
 import shlex
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import nibabel as nib
+import numpy as np
+from PySide6.QtWidgets import QApplication
 
 from scripts.rabies_subject_manager import (
+    ProjectSetupWindow,
+    SubjectManager,
     _expand_template_paths,
     clear_results,
     discover_bids_folders,
     discover_subjects,
     generate_subject_script,
+    nifti_orientation,
+    nifti_orientation_issues,
     move_cleaned_timeseries,
     clear_output_subjects,
     output_subject_names,
+    session_nifti_orientations,
     stage_status,
     subject_has_previous_results,
 )
@@ -27,9 +38,13 @@ class SubjectManagerTests(unittest.TestCase):
             (subject / "ses-1" / "anat").mkdir(parents=True)
             (subject / "ses-1" / "func" / "sub-001_task-rest_bold.nii.gz").touch()
             (subject / "ses-1" / "anat" / "sub-001_T2w.nii.gz").touch()
+            (subject / "ses-2" / "func").mkdir(parents=True)
+            (subject / "ses-2" / "anat").mkdir(parents=True)
+            (subject / "ses-2" / "func" / "sub-001_ses-2_task-rest_bold.nii.gz").touch()
+            (subject / "ses-2" / "anat" / "sub-001_ses-2_T2w.nii.gz").touch()
             (bids / "not-a-subject").mkdir()
 
-            self.assertEqual(discover_subjects(bids), [("sub-001", 1, 1)])
+            self.assertEqual(discover_subjects(bids), [("sub-001", 2, 2)])
 
     def test_subjects_can_be_discovered_from_arbitrarily_named_bids_folder(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -67,6 +82,156 @@ class SubjectManagerTests(unittest.TestCase):
                 with self.subTest(prefix=prefix):
                     with self.assertRaises(ValueError):
                         discover_subjects(root, prefix)
+
+    def test_nifti_orientations_are_reported_for_each_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            subject_dir = Path(temporary_directory) / "sub-001"
+            ras_file = subject_dir / "ses-1" / "anat" / "sub-001_ses-1_T2w.nii.gz"
+            lps_file = subject_dir / "ses-2" / "func" / "sub-001_ses-2_bold.nii.gz"
+            ras_file.parent.mkdir(parents=True)
+            lps_file.parent.mkdir(parents=True)
+            nib.save(
+                nib.Nifti1Image(np.zeros((2, 2, 2)), np.eye(4)),
+                str(ras_file),
+            )
+            lps_affine = np.diag([-1, -1, 1, 1])
+            nib.save(
+                nib.Nifti1Image(np.zeros((2, 2, 2)), lps_affine),
+                str(lps_file),
+            )
+
+            sessions = session_nifti_orientations(subject_dir)
+
+            self.assertEqual(list(sessions), ["ses-1", "ses-2"])
+            self.assertEqual(sessions["ses-1"], [(ras_file, "RAS")])
+            self.assertEqual(sessions["ses-2"], [(lps_file, "LPS")])
+            self.assertEqual(nifti_orientation(ras_file), "RAS")
+            issues = nifti_orientation_issues(subject_dir.parent, ["sub-001"])
+            self.assertEqual(
+                issues,
+                ["sub-001/ses-2/func/sub-001_ses-2_bold.nii.gz: LPS"],
+            )
+
+    def test_unreadable_niftis_and_subjects_without_niftis_block_submission(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            bids_dir = Path(temporary_directory)
+            subject_dir = bids_dir / "sub-001"
+            (subject_dir / "ses-1").mkdir(parents=True)
+            (subject_dir / "ses-1" / "invalid.nii.gz").write_bytes(b"not a NIfTI")
+            (bids_dir / "sub-002").mkdir()
+
+            issues = nifti_orientation_issues(bids_dir, ["sub-001", "sub-002"])
+
+            self.assertIn("sub-001/ses-1/invalid.nii.gz: Unreadable:", issues[0])
+            self.assertEqual(issues[1], "sub-002: no NIfTI files found.")
+
+    def test_selecting_subject_shows_session_orientations_and_results(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bids_dir = root / "og_bids"
+            subject_dir = bids_dir / "sub-001"
+            for session, affine in (
+                ("ses-1", np.eye(4)),
+                ("ses-2", np.diag([-1, -1, 1, 1])),
+            ):
+                nifti = (
+                    subject_dir / session / "func"
+                    / f"sub-001_{session}_task-rest_bold.nii.gz"
+                )
+                nifti.parent.mkdir(parents=True)
+                nib.save(nib.Nifti1Image(np.zeros((2, 2, 2)), affine), str(nifti))
+            (root / "rabies_output").mkdir()
+            archived_session = root / "rabies_results" / "sub-001" / "ses-1"
+            archived_session.mkdir(parents=True)
+            preprocess_archive = (
+                root / "rabies_results" / "sub-001" / "preprocess"
+            )
+            preprocess_archive.mkdir(parents=True)
+            (preprocess_archive / "rabies_preprocess_workflow.pkl").touch()
+
+            setup = ProjectSetupWindow()
+            setup.path_fields["root"].setText(str(root))
+            setup.path_fields["output"].setText(str(root / "rabies_output"))
+            setup.path_fields["results"].setText(str(root / "rabies_results"))
+            bids_index = setup.bids_folders.findData(str(bids_dir))
+            setup.bids_folders.setCurrentIndex(bids_index)
+            manager = SubjectManager(setup)
+            try:
+                manager.subjects.setCurrentCell(0, 0)
+
+                self.assertEqual(manager.session_details.rowCount(), 2)
+                self.assertEqual(manager.session_details.item(0, 0).text(), "ses-1")
+                self.assertIn("RAS", manager.session_details.item(0, 1).text())
+                self.assertEqual(manager.session_details.item(0, 2).text(), "Present")
+                self.assertEqual(manager.session_details.item(0, 3).text(), "Complete")
+                self.assertEqual(manager.session_details.item(1, 0).text(), "ses-2")
+                self.assertIn("LPS", manager.session_details.item(1, 1).text())
+            finally:
+                manager.close()
+                setup.close()
+                app.processEvents()
+
+    def test_non_ras_subject_can_create_scripts_but_cannot_submit(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bids_dir = root / "og_bids"
+            subject_dir = bids_dir / "sub-001" / "ses-1"
+            bold_file = subject_dir / "func" / "sub-001_ses-1_task-rest_bold.nii.gz"
+            anat_file = subject_dir / "anat" / "sub-001_ses-1_T2w.nii.gz"
+            bold_file.parent.mkdir(parents=True)
+            anat_file.parent.mkdir(parents=True)
+            lps_affine = np.diag([-1, -1, 1, 1])
+            nib.save(
+                nib.Nifti1Image(np.zeros((2, 2, 2)), lps_affine),
+                str(bold_file),
+            )
+            nib.save(
+                nib.Nifti1Image(np.zeros((2, 2, 2)), np.eye(4)),
+                str(anat_file),
+            )
+            output = root / "rabies_output"
+            templates = root / "templates"
+            output.mkdir()
+            templates.mkdir()
+            image = root / "rabies.sif"
+            image.touch()
+
+            setup = ProjectSetupWindow()
+            setup.path_fields["root"].setText(str(root))
+            setup.path_fields["output"].setText(str(output))
+            setup.path_fields["results"].setText(str(root / "rabies_results"))
+            setup.path_fields["templates"].setText(str(templates))
+            setup.path_fields["image"].setText(str(image))
+            setup.bids_folders.setCurrentIndex(
+                setup.bids_folders.findData(str(bids_dir))
+            )
+            manager = SubjectManager(setup)
+            try:
+                manager.subjects.selectRow(0)
+                script_path = output / "tmp_script" / "scrip_sub-001.sh"
+                with patch("scripts.rabies_subject_manager.QMessageBox.information"):
+                    manager.create_scripts()
+                self.assertTrue(script_path.is_file())
+
+                with patch(
+                    "scripts.rabies_subject_manager.QMessageBox.critical"
+                ) as show_error, patch(
+                    "scripts.rabies_subject_manager.subprocess.run"
+                ) as submit:
+                    manager.submit_scripts()
+
+                show_error.assert_called_once()
+                self.assertEqual(show_error.call_args.args[1], "NIfTI orientation check failed")
+                self.assertIn("LPS", show_error.call_args.args[2])
+                submit.assert_not_called()
+            finally:
+                manager.close()
+                setup.close()
+                app.processEvents()
 
     def test_root_folder_choices_only_include_directories_with_subjects(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -287,6 +452,47 @@ class SubjectManagerTests(unittest.TestCase):
             self.assertIn("confound_correction_datasink", script)
             self.assertIn("input bold.nii.gz", script)
             self.assertIn(str(root / "input bold.nii.gz"), script)
+
+    def test_generated_script_preserves_and_archives_each_bids_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            subject_dir = root / "og_bids" / "sub-001"
+            bold_files = [
+                subject_dir / "ses-1" / "func" / "sub-001_ses-1_bold.nii.gz",
+                subject_dir / "ses-2" / "func" / "sub-001_ses-2_bold.nii.gz",
+            ]
+            anat_files = [
+                subject_dir / "ses-1" / "anat" / "sub-001_ses-1_T2w.nii.gz",
+                subject_dir / "ses-2" / "anat" / "sub-001_ses-2_T2w.nii.gz",
+            ]
+
+            script = generate_subject_script(
+                "sub-001",
+                bold_files,
+                anat_files,
+                root / "output",
+                root / "results",
+                root / "templates",
+                root / "rabies.sif",
+            )
+
+            for session, modality, source in (
+                ("ses-1", "func", bold_files[0]),
+                ("ses-1", "anat", anat_files[0]),
+                ("ses-2", "func", bold_files[1]),
+                ("ses-2", "anat", anat_files[1]),
+            ):
+                staged_directory = root / "output" / "tmp_bids" / "sub-001" / session / modality
+                self.assertIn(f"mkdir -p {shlex.quote(str(staged_directory))}", script)
+                self.assertIn(
+                    f"cp -f {shlex.quote(str(source))} {shlex.quote(str(staged_directory))}/",
+                    script,
+                )
+                self.assertIn(
+                    f"cp -a {shlex.quote(str(root / 'output' / 'tmp_bids' / 'sub-001' / session))} "
+                    f"{shlex.quote(str(root / 'results' / 'sub-001'))}/",
+                    script,
+                )
 
     def test_custom_stage_arguments_are_used_and_json_braces_are_preserved(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import nibabel as nib
+from nibabel.filebasedimages import ImageFileError
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -205,6 +207,64 @@ def discover_subjects(
     return subjects
 
 
+def nifti_orientation(path: Path) -> str:
+    """Return a NIfTI's axis orientation, or an explicit unreadable status."""
+    try:
+        image = nib.load(str(path))
+    except (ImageFileError, OSError, ValueError) as error:
+        return f"Unreadable: {error}"
+    return "".join(axis or "?" for axis in nib.aff2axcodes(image.affine))
+
+
+def session_nifti_orientations(
+    subject_dir: Path,
+) -> dict[str, list[tuple[Path, str]]]:
+    """Return NIfTI orientations grouped by BIDS session."""
+    sessions = {
+        entry.name: []
+        for entry in sorted(subject_dir.iterdir())
+        if entry.is_dir() and entry.name.startswith("ses-")
+    }
+    for path in sorted(subject_dir.rglob("*")):
+        if not path.is_file() or not (
+            path.name.endswith(".nii") or path.name.endswith(".nii.gz")
+        ):
+            continue
+        relative = path.relative_to(subject_dir)
+        session = (
+            relative.parts[0]
+            if relative.parts and relative.parts[0].startswith("ses-")
+            else "No session"
+        )
+        sessions.setdefault(session, []).append((path, nifti_orientation(path)))
+    return sessions
+
+
+def nifti_orientation_issues(bids_dir: Path, subjects: list[str]) -> list[str]:
+    """Return selected subjects' missing, unreadable, or non-RAS NIfTIs."""
+    issues = []
+    for subject in subjects:
+        subject_dir = bids_dir / subject
+        if not subject_dir.is_dir():
+            issues.append(f"{subject}: BIDS subject folder not found.")
+            continue
+        sessions = session_nifti_orientations(subject_dir)
+        if not any(sessions.values()):
+            issues.append(f"{subject}: no NIfTI files found.")
+        for session, files in sessions.items():
+            for path, orientation in files:
+                if orientation != "RAS":
+                    session_dir = (
+                        subject_dir if session == "No session"
+                        else subject_dir / session
+                    )
+                    relative_path = path.relative_to(session_dir)
+                    issues.append(
+                        f"{subject}/{session}/{relative_path.as_posix()}: {orientation}"
+                    )
+    return issues
+
+
 def discover_bids_folders(root_dir: Path, subject_prefix: str = "sub-") -> list[Path]:
     """Return immediate child folders containing subject folders with this prefix."""
     if not root_dir.is_dir():
@@ -254,6 +314,17 @@ def _expand_template_paths(arguments: str, templates: dict[str, str]) -> str:
     for name, path in templates.items():
         arguments = arguments.replace(f"{{{name}}}", path)
     return arguments
+
+
+def _session_name(path: Path, subject: str) -> str | None:
+    """Return a file's BIDS session when it is below the subject directory."""
+    for parent in path.parents:
+        if parent.name == subject:
+            relative_path = path.relative_to(parent)
+            if relative_path.parts and relative_path.parts[0].startswith("ses-"):
+                return relative_path.parts[0]
+            return None
+    return None
 
 
 def generate_subject_script(
@@ -337,12 +408,22 @@ def generate_subject_script(
         f"preprocess_archive={shlex.quote(str(preprocess_archive))}",
         f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis_archive={shlex.quote(str(analysis_archive))}",
-        'mkdir -p "$bids/func" "$bids/anat" "$preprocess" "$confound" "$analysis"',
+        'mkdir -p "$bids" "$preprocess" "$confound" "$analysis"',
     ]
-    for path in bold_files:
-        lines.append(f"cp -f {shlex.quote(str(path))} \"$bids/func/\"")
-    for path in anat_files:
-        lines.append(f"cp -f {shlex.quote(str(path))} \"$bids/anat/\"")
+    for paths, modality in ((bold_files, "func"), (anat_files, "anat")):
+        for path in paths:
+            session = _session_name(path, subject)
+            relative_directory = Path(session) / modality if session else Path(modality)
+            bids_directory = bids / relative_directory
+            lines.append(f"mkdir -p {shlex.quote(str(bids_directory))}")
+            lines.append(
+                f"cp -f {shlex.quote(str(path))} {shlex.quote(str(bids_directory))}/"
+            )
+    sessions = sorted({
+        session
+        for path in (*bold_files, *anat_files)
+        if (session := _session_name(path, subject)) is not None
+    })
 
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
@@ -399,9 +480,15 @@ def generate_subject_script(
         "  find \"$analysis\" -mindepth 1 -delete",
         "fi",
         "if [[ -d \"$confound\" ]]; then find \"$confound\" -mindepth 1 -delete; fi",
-        'echo "Finished subject $subject"',
-        "",
     ])
+    for session in sessions:
+        session_directory = bids / session
+        lines.extend([
+            f"mkdir -p {shlex.quote(str(result_subject))}",
+            f"cp -a {shlex.quote(str(session_directory))} "
+            f"{shlex.quote(str(result_subject))}/",
+        ])
+    lines.extend(['echo "Finished subject $subject"', ""])
     return "\n".join(lines)
 
 
@@ -641,8 +728,8 @@ class SubjectManager(QMainWindow):
         self.path_fields = setup_window.path_fields
         self.bids_folders = setup_window.bids_folders
         self.setWindowTitle("RABIES Subject Manager")
-        self.resize(1180, 740)
-        self.setMinimumSize(900, 600)
+        self.resize(1180, 900)
+        self.setMinimumSize(900, 740)
         self.stage_args = {
             "Preprocessing": PREPROCESS_ARGS,
             "Confound correction": CONFOUND_ARGS,
@@ -676,7 +763,29 @@ class SubjectManager(QMainWindow):
         self.subjects.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
-        layout.addWidget(self.subjects, 1)
+        self.subjects.currentCellChanged.connect(self._show_session_details)
+        layout.addWidget(self.subjects, 2)
+
+        self.session_details_label = QLabel("Session details: select a subject.")
+        layout.addWidget(self.session_details_label)
+        self.session_details = QTableWidget(0, 6)
+        self.session_details.setHorizontalHeaderLabels([
+            "Session",
+            "NIfTI orientations",
+            "Session archive",
+            "Subject preprocess",
+            "Subject confound",
+            "Subject analysis",
+        ])
+        self.session_details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.session_details.setWordWrap(True)
+        self.session_details.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.session_details.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        layout.addWidget(self.session_details, 1)
 
         options = QHBoxLayout()
         for label, callback in (
@@ -768,27 +877,86 @@ class SubjectManager(QMainWindow):
             QMessageBox.critical(self, "Could not read subjects", str(error))
             return
 
-        self.subjects.setRowCount(len(discovered))
-        for row, (subject, bold_count, anat_count) in enumerate(discovered):
-            states = stage_status(subject, output, results)
-            previous_results = subject_has_previous_results(subject, results)
+        was_blocked = self.subjects.blockSignals(True)
+        try:
+            self.subjects.setRowCount(len(discovered))
+            for row, (subject, bold_count, anat_count) in enumerate(discovered):
+                states = stage_status(subject, output, results)
+                previous_results = subject_has_previous_results(subject, results)
+                values = (
+                    subject,
+                    str(bold_count),
+                    str(anat_count),
+                    "Complete" if states["preprocess"] else "Not found",
+                    "Complete" if states["confound"] else "Not found",
+                    "Existing output (clear to rerun)" if previous_results else (
+                        "Complete" if states["analysis"] else "Not found"
+                    ),
+                )
+                for column, value in enumerate(values):
+                    self.subjects.setItem(
+                        row,
+                        column,
+                        QTableWidgetItem(value),
+                    )
+        finally:
+            self.subjects.blockSignals(was_blocked)
+        self.session_details.setRowCount(0)
+        self.session_details_label.setText("Session details: select a subject.")
+        self.status.setText(f"Found {len(discovered)} subject(s) in {bids_dir}.")
+
+    def _show_session_details(
+        self, current_row: int, _current_column: int,
+        _previous_row: int, _previous_column: int,
+    ) -> None:
+        subject_item = self.subjects.item(current_row, 0)
+        bids_dir = self._selected_bids_dir()
+        if subject_item is None or bids_dir is None:
+            self.session_details.setRowCount(0)
+            self.session_details_label.setText("Session details: select a subject.")
+            return
+
+        subject = subject_item.text()
+        _, output, results, _, _ = self._project_paths()
+        try:
+            sessions = session_nifti_orientations(bids_dir / subject)
+        except OSError as error:
+            QMessageBox.critical(self, "Could not read session files", str(error))
+            return
+        if not sessions:
+            sessions = {"No session": []}
+        states = stage_status(subject, output, results)
+        self.session_details.setRowCount(len(sessions))
+        for row, (session, files) in enumerate(sessions.items()):
+            orientation_lines = [
+                f"{path.relative_to(bids_dir / subject).as_posix()}: {orientation}"
+                for path, orientation in files
+            ] or ["No NIfTI files found"]
+            archive = (
+                "Not applicable"
+                if session == "No session"
+                else (
+                    "Present"
+                    if (results / subject / session).is_dir()
+                    else "Not found"
+                )
+            )
             values = (
-                subject,
-                str(bold_count),
-                str(anat_count),
+                session,
+                "\n".join(orientation_lines),
+                archive,
                 "Complete" if states["preprocess"] else "Not found",
                 "Complete" if states["confound"] else "Not found",
-                "Existing output (clear to rerun)" if previous_results else (
-                    "Complete" if states["analysis"] else "Not found"
-                ),
+                "Complete" if states["analysis"] else "Not found",
             )
             for column, value in enumerate(values):
-                self.subjects.setItem(
-                    row,
-                    column,
-                    QTableWidgetItem(value),
-                )
-        self.status.setText(f"Found {len(discovered)} subject(s) in {bids_dir}.")
+                item = QTableWidgetItem(value)
+                if column == 1:
+                    item.setToolTip(value)
+                self.session_details.setItem(row, column, item)
+        self.session_details_label.setText(
+            f"Sessions for {subject} (stage results are subject-wide):"
+        )
 
     def select_all(self) -> None:
         self.subjects.selectAll()
@@ -1096,11 +1264,32 @@ class SubjectManager(QMainWindow):
             QMessageBox.information(self, "No subjects selected", "Select at least one subject first.")
             return
         _, output, results, _, _ = self._project_paths()
+        bids_dir = self._selected_bids_dir()
+        if bids_dir is None or not bids_dir.is_dir():
+            QMessageBox.critical(
+                self, "Original BIDS folder not set",
+                "Select an existing original BIDS folder before submitting jobs.",
+            )
+            return
         if not self.path_fields["output"].text().strip():
             QMessageBox.critical(self, "Output directory not set", "Select a project root or set an output directory.")
             return
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
+            return
+        try:
+            orientation_issues = nifti_orientation_issues(bids_dir, selected)
+        except OSError as error:
+            QMessageBox.critical(self, "Could not check NIfTI orientations", str(error))
+            return
+        if orientation_issues:
+            QMessageBox.critical(
+                self,
+                "NIfTI orientation check failed",
+                "Jobs cannot be submitted unless every BIDS NIfTI is readable and in RAS orientation. "
+                "Scripts may still be created for inspection.\n\n"
+                + "\n".join(orientation_issues),
+            )
             return
         blocked = [
             subject for subject in selected
