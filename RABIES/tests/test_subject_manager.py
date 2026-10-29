@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import nibabel as nib
 import numpy as np
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from scripts.rabies_subject_manager import (
     ProjectSetupWindow,
@@ -19,6 +19,7 @@ from scripts.rabies_subject_manager import (
     generate_subject_script,
     nifti_orientation,
     nifti_orientation_issues,
+    reorient_niftis_to_ras,
     move_cleaned_timeseries,
     clear_output_subjects,
     output_subject_names,
@@ -112,6 +113,39 @@ class SubjectManagerTests(unittest.TestCase):
                 ["sub-001/ses-2/func/sub-001_ses-2_bold.nii.gz: LPS"],
             )
 
+    def test_reorient_nifti_to_ras_preserves_original_outside_bids_dataset(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bids_dir = root / "og_bids"
+            nifti = (
+                bids_dir / "sub-001" / "ses-1" / "anat"
+                / "sub-001_ses-1_T2w.nii.gz"
+            )
+            nifti.parent.mkdir(parents=True)
+            nib.save(
+                nib.Nifti1Image(
+                    np.arange(24, dtype=np.int16).reshape((2, 3, 4)),
+                    np.diag([-1, -1, 1, 1]),
+                ),
+                str(nifti),
+            )
+            original_bytes = nifti.read_bytes()
+
+            reoriented, backup_root = reorient_niftis_to_ras(
+                bids_dir, ["sub-001"]
+            )
+
+            self.assertEqual(reoriented, [nifti])
+            self.assertEqual(nifti_orientation(nifti), "RAS")
+            self.assertIsNotNone(backup_root)
+            backup = (
+                backup_root / "sub-001" / "ses-1" / "anat"
+                / "sub-001_ses-1_T2w.nii.gz"
+            )
+            self.assertEqual(backup.read_bytes(), original_bytes)
+            self.assertEqual(nifti_orientation(backup), "LPS")
+            self.assertNotEqual(nifti.parent, backup.parent)
+
     def test_unreadable_niftis_and_subjects_without_niftis_block_submission(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             bids_dir = Path(temporary_directory)
@@ -163,11 +197,46 @@ class SubjectManagerTests(unittest.TestCase):
 
                 self.assertEqual(manager.session_details.rowCount(), 2)
                 self.assertEqual(manager.session_details.item(0, 0).text(), "ses-1")
-                self.assertIn("RAS", manager.session_details.item(0, 1).text())
+                self.assertEqual(
+                    manager.session_details.item(0, 1).text(),
+                    "ses-1/func : RAS",
+                )
+                self.assertEqual(
+                    manager.session_details.item(0, 1).toolTip(),
+                    str(
+                        (subject_dir / "ses-1" / "func"
+                         / "sub-001_ses-1_task-rest_bold.nii.gz").resolve()
+                    ),
+                )
                 self.assertEqual(manager.session_details.item(0, 2).text(), "Present")
                 self.assertEqual(manager.session_details.item(0, 3).text(), "Complete")
                 self.assertEqual(manager.session_details.item(1, 0).text(), "ses-2")
-                self.assertIn("LPS", manager.session_details.item(1, 1).text())
+                self.assertEqual(
+                    manager.session_details.item(1, 1).text(),
+                    "ses-2/func : LPS",
+                )
+                manager.subjects.selectRow(0)
+                with patch(
+                    "scripts.rabies_subject_manager.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ), patch(
+                    "scripts.rabies_subject_manager.QMessageBox.information"
+                ):
+                    manager.reorient_selected_niftis()
+
+                ses2_nifti = (
+                    subject_dir / "ses-2" / "func"
+                    / "sub-001_ses-2_task-rest_bold.nii.gz"
+                )
+                self.assertEqual(nifti_orientation(ses2_nifti), "RAS")
+                backup_parent = root / "og_bids_orientation_backups"
+                self.assertTrue(backup_parent.is_dir())
+                self.assertEqual(
+                    nifti_orientation(
+                        next(backup_parent.rglob(ses2_nifti.name))
+                    ),
+                    "LPS",
+                )
             finally:
                 manager.close()
                 setup.close()

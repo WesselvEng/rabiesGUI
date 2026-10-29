@@ -38,7 +38,12 @@ counts and the status of preprocessing, confound correction, and analysis.
 Select a subject to view its sessions, every NIfTI's orientation, whether the
 session input archive is present, and the subject-wide stage results. Script
 creation is allowed regardless of orientation, but job submission is blocked
-if any BIDS NIfTI is unreadable or is not in RAS orientation.
+if any BIDS NIfTI is unreadable or is not in RAS orientation. Orientation
+entries show a concise session/modality label; hover over an entry to see its
+full path. Use **Reorient selected NIfTIs to RAS** to convert non-RAS files.
+The GUI asks for confirmation, preserves originals in a timestamped
+`<BIDS folder>_orientation_backups` directory beside the BIDS folder, and
+replaces the input files with RAS-oriented copies.
 
 Stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. RABIES writes this workflow pickle after a

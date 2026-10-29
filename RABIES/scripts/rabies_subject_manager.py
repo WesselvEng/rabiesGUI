@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import nibabel as nib
@@ -263,6 +266,107 @@ def nifti_orientation_issues(bids_dir: Path, subjects: list[str]) -> list[str]:
                         f"{subject}/{session}/{relative_path.as_posix()}: {orientation}"
                     )
     return issues
+
+
+def reorient_niftis_to_ras(
+    bids_dir: Path, subjects: list[str]
+) -> tuple[list[Path], Path | None]:
+    """Reorient selected subjects' non-RAS NIfTIs, retaining timestamped backups."""
+    images: list[tuple[str, Path, nib.spatialimages.SpatialImage]] = []
+    issues = []
+    for subject in subjects:
+        subject_dir = bids_dir / subject
+        if not subject_dir.is_dir():
+            issues.append(f"{subject}: BIDS subject folder not found.")
+            continue
+        sessions = session_nifti_orientations(subject_dir)
+        if not any(sessions.values()):
+            issues.append(f"{subject}: no NIfTI files found.")
+        for session, files in sessions.items():
+            for path, orientation in files:
+                if orientation.startswith("Unreadable:"):
+                    issues.append(f"{path}: {orientation}")
+                elif orientation != "RAS":
+                    try:
+                        canonical = nib.as_closest_canonical(nib.load(str(path)))
+                    except (ImageFileError, OSError, ValueError) as error:
+                        issues.append(f"{path}: {error}")
+                        continue
+                    if "".join(
+                        axis or "?" for axis in nib.aff2axcodes(canonical.affine)
+                    ) != "RAS":
+                        issues.append(f"{path}: could not be reoriented to RAS.")
+                    else:
+                        images.append((subject, path, canonical))
+    if issues:
+        raise ValueError(
+            "Cannot reorient NIfTIs until all selected files are readable and "
+            "each selected subject contains NIfTI files:\n" + "\n".join(issues)
+        )
+    if not images:
+        return [], None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_root = (
+        bids_dir.parent / f"{bids_dir.name}_orientation_backups" / timestamp
+    )
+    temporary_files: list[tuple[Path, Path]] = []
+    try:
+        for subject, path, _image in images:
+            subject_dir = bids_dir / subject
+            backup = backup_root / subject / path.relative_to(subject_dir)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backup)
+
+        for _subject, path, image in images:
+            extension = ".nii.gz" if path.name.endswith(".nii.gz") else ".nii"
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".rabies-reorient-",
+                suffix=extension,
+                dir=path.parent,
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary_name)
+            temporary_files.append((temporary_path, path))
+            nib.save(image, str(temporary_path))
+            saved = nib.load(str(temporary_path))
+            orientation = "".join(
+                axis or "?" for axis in nib.aff2axcodes(saved.affine)
+            )
+            if orientation != "RAS":
+                raise ValueError(
+                    f"Reoriented file did not have RAS orientation: {path}"
+                )
+
+        for temporary_path, path in temporary_files:
+            os.replace(temporary_path, path)
+    except (ImageFileError, OSError, ValueError) as error:
+        raise OSError(
+            f"NIfTI reorientation failed. Original files are backed up in "
+            f"{backup_root}: {error}"
+        ) from error
+    finally:
+        for temporary_path, _path in temporary_files:
+            temporary_path.unlink(missing_ok=True)
+
+    return [path for _subject, path, _image in images], backup_root
+
+
+def _nifti_display_label(path: Path, subject_dir: Path, orientation: str) -> str:
+    relative = path.relative_to(subject_dir)
+    session = (
+        relative.parts[0]
+        if relative.parts and relative.parts[0].startswith("ses-")
+        else None
+    )
+    modality = next(
+        (part for part in relative.parts[:-1] if part in {"anat", "func"}),
+        None,
+    )
+    location = "/".join(part for part in (session, modality) if part)
+    if not location:
+        location = session or "No session"
+    return f"{location} : {orientation}"
 
 
 def discover_bids_folders(root_dir: Path, subject_prefix: str = "sub-") -> list[Path]:
@@ -779,6 +883,10 @@ class SubjectManager(QMainWindow):
         ])
         self.session_details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.session_details.setWordWrap(True)
+        self.session_details.setStyleSheet(
+            "QToolTip { background-color: #ffffdc; color: #000000; "
+            "border: 1px solid #767676; padding: 2px; }"
+        )
         self.session_details.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
@@ -802,6 +910,7 @@ class SubjectManager(QMainWindow):
         for label, callback in (
             ("RABIES arguments…", self.edit_arguments),
             ("Create scripts", self.create_scripts),
+            ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("Submit scripts with sbatch", self.submit_scripts),
         ):
             button = QPushButton(label)
@@ -926,12 +1035,15 @@ class SubjectManager(QMainWindow):
         if not sessions:
             sessions = {"No session": []}
         states = stage_status(subject, output, results)
-        self.session_details.setRowCount(len(sessions))
-        for row, (session, files) in enumerate(sessions.items()):
-            orientation_lines = [
-                f"{path.relative_to(bids_dir / subject).as_posix()}: {orientation}"
-                for path, orientation in files
-            ] or ["No NIfTI files found"]
+        rows = [
+            (session, path, orientation)
+            for session, files in sessions.items()
+            for path, orientation in files
+        ]
+        if not rows:
+            rows = [(session, None, "No NIfTI files found") for session in sessions]
+        self.session_details.setRowCount(len(rows))
+        for row, (session, path, orientation) in enumerate(rows):
             archive = (
                 "Not applicable"
                 if session == "No session"
@@ -943,7 +1055,11 @@ class SubjectManager(QMainWindow):
             )
             values = (
                 session,
-                "\n".join(orientation_lines),
+                (
+                    _nifti_display_label(path, bids_dir / subject, orientation)
+                    if path is not None
+                    else orientation
+                ),
                 archive,
                 "Complete" if states["preprocess"] else "Not found",
                 "Complete" if states["confound"] else "Not found",
@@ -951,8 +1067,8 @@ class SubjectManager(QMainWindow):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column == 1:
-                    item.setToolTip(value)
+                if column == 1 and path is not None:
+                    item.setToolTip(str(path.resolve()))
                 self.session_details.setItem(row, column, item)
         self.session_details_label.setText(
             f"Sessions for {subject} (stage results are subject-wide):"
@@ -1183,6 +1299,100 @@ class SubjectManager(QMainWindow):
             f"\nSkipped {len(skipped)} file(s) because the destination filename already exists."
         )
         QMessageBox.information(self, "Cleaned timeseries", message)
+
+    def reorient_selected_niftis(self) -> None:
+        selected = self._selected_subjects()
+        if not selected:
+            QMessageBox.information(
+                self, "No subjects selected",
+                "Select the subjects whose NIfTI files you want to reorient.",
+            )
+            return
+        bids_dir = self._selected_bids_dir()
+        if bids_dir is None or not bids_dir.is_dir():
+            QMessageBox.critical(
+                self, "Original BIDS folder not set",
+                "Select an existing original BIDS folder before reorienting files.",
+            )
+            return
+
+        candidates = []
+        unreadable = []
+        try:
+            for subject in selected:
+                for files in session_nifti_orientations(bids_dir / subject).values():
+                    for path, orientation in files:
+                        if orientation.startswith("Unreadable:"):
+                            unreadable.append(f"{path}: {orientation}")
+                        elif orientation != "RAS":
+                            candidates.append((path, orientation))
+        except OSError as error:
+            QMessageBox.critical(self, "Could not read NIfTI files", str(error))
+            return
+        if unreadable:
+            QMessageBox.critical(
+                self, "Cannot reorient unreadable NIfTIs",
+                "The following files could not be read:\n" + "\n".join(unreadable),
+            )
+            return
+        if not candidates:
+            QMessageBox.information(
+                self, "NIfTIs already in RAS",
+                "No non-RAS NIfTI files were found for the selected subjects.",
+            )
+            return
+
+        file_list = "\n".join(
+            f"{path} ({orientation})" for path, orientation in candidates
+        )
+        confirmation = QMessageBox.question(
+            self,
+            "Reorient NIfTIs to RAS",
+            f"This will replace {len(candidates)} non-RAS NIfTI file(s) in the "
+            "BIDS dataset. Original files will be backed up outside the dataset "
+            "in a timestamped orientation-backups folder.\n\n"
+            f"{file_list}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            reoriented, backup_root = reorient_niftis_to_ras(bids_dir, selected)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Could not reorient NIfTI files", str(error))
+            return
+        if backup_root is None:
+            QMessageBox.information(
+                self, "NIfTIs already in RAS",
+                "No non-RAS NIfTI files needed reorientation.",
+            )
+            return
+        self.refresh_subjects()
+        for row in range(self.subjects.rowCount()):
+            item = self.subjects.item(row, 0)
+            if item is not None and item.text() in selected:
+                self.subjects.selectRow(row)
+        first_row = next(
+            (
+                row
+                for row in range(self.subjects.rowCount())
+                if self.subjects.item(row, 0) is not None
+                and self.subjects.item(row, 0).text() == selected[0]
+            ),
+            -1,
+        )
+        if first_row >= 0:
+            self.subjects.setCurrentCell(first_row, 0)
+        self.status.setText(
+            f"Reoriented {len(reoriented)} NIfTI file(s) to RAS. "
+            f"Originals backed up in {backup_root}."
+        )
+        QMessageBox.information(
+            self,
+            "NIfTIs reoriented",
+            f"Reoriented {len(reoriented)} NIfTI file(s) to RAS.\n"
+            f"Originals backed up in:\n{backup_root}",
+        )
 
     def create_scripts(self) -> None:
         selected = self._selected_subjects()
