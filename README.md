@@ -3,9 +3,10 @@
 Two PySide6 GUIs are available for viewing BIDS subjects, checking NIfTI
 orientations, and creating or submitting RABIES SLURM jobs:
 
-- `manager.py` creates one job per selected subject. Each subject's sessions
-  are processed together, and archived inputs retain their `ses-*` folders.
-- `rabies_subject_manager.py` creates one cohort-wide job for the full selected
+- `rabies_subject_manager.py` creates one job per selected subject. Each
+  subject's sessions are processed together, and archived inputs retain their
+  `ses-*` folders.
+- `rabies_cohort_manager.py` creates one cohort-wide job for the full selected
   BIDS dataset, using RABIES' native subject/session handling.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
@@ -13,11 +14,11 @@ BIDS, output, and results directories. To submit jobs from the GUI, that
 system must also have `sbatch` available. For example:
 
 ```sh
-python -m pip install -r RABIES/scripts/rabies_gui_requirements.txt
+python -m pip install -r rabies_gui_requirements.txt
 # One job per selected subject
-python RABIES/scripts/manager.py
+python rabies_subject_manager.py
 # One cohort-wide job
-python RABIES/scripts/rabies_subject_manager.py
+python rabies_cohort_manager.py
 ```
 
 Both managers use the same project setup and stage arguments. Their generated
@@ -32,8 +33,9 @@ paths with `<project root>/rabies_output/` and
 `<project root>/rabies_results/`; edit those fields afterward if needed.
 
 The instructions below describe the cohort-wide manager,
-`rabies_subject_manager.py`. For independent per-subject jobs, launch
-`manager.py` instead and create/submit scripts for the selected subjects.
+`rabies_cohort_manager.py`. For independent per-subject jobs, launch
+`rabies_subject_manager.py` instead and create/submit scripts for the selected
+subjects.
 
 Set **Subject folder prefix** to the leading text shared by subject directory
 names. It defaults to `sub-` (for example, `sub-001`); change it to `mouse-`,

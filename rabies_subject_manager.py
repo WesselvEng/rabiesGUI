@@ -77,8 +77,12 @@ def subject_has_previous_results(subject: str, results_dir: Path) -> bool:
 def clear_results(results_dir: Path, subjects: list[str] | None = None) -> int:
     """Remove archived result entries without deleting the results directory."""
     results_dir = results_dir.expanduser().resolve()
-    protected_paths = (Path.home().resolve(), Path(__file__).resolve().parents[1])
-    if any(results_dir == path or results_dir in path.parents for path in protected_paths):
+    project_root = Path(__file__).resolve().parent
+    protected_paths = (Path.home().resolve(), project_root)
+    if (
+        any(results_dir == path or results_dir in path.parents for path in protected_paths)
+        or project_root in results_dir.parents
+    ):
         raise ValueError(f"Refusing to remove contents of protected directory: {results_dir}")
     if not results_dir.is_dir():
         return 0
@@ -117,8 +121,12 @@ def output_subject_names(output_dir: Path) -> set[str]:
 def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -> int:
     """Remove per-subject workflow and staging folders, preserving shared files."""
     output_dir = output_dir.expanduser().resolve()
-    protected_paths = (Path.home().resolve(), Path(__file__).resolve().parents[1])
-    if any(output_dir == path or output_dir in path.parents for path in protected_paths):
+    project_root = Path(__file__).resolve().parent
+    protected_paths = (Path.home().resolve(), project_root)
+    if (
+        any(output_dir == path or output_dir in path.parents for path in protected_paths)
+        or project_root in output_dir.parents
+    ):
         raise ValueError(f"Refusing to remove contents of protected directory: {output_dir}")
     if not output_dir.is_dir():
         return 0
