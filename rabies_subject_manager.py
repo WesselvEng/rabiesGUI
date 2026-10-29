@@ -303,6 +303,8 @@ def output_subject_names(output_dir: Path) -> set[str]:
         if parent.is_dir() and not parent.is_symlink()
         for entry in parent.iterdir()
         if entry.is_dir()
+        and not entry.is_symlink()
+        and any(entry.iterdir())
     }
 
 
@@ -335,6 +337,7 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
         subject_names = set(subjects)
 
     removed = 0
+    staging_dirs = {"tmp_bids", "tmp_bids_session"}
     for directory_name in subject_dirs:
         parent = output_dir / directory_name
         if not parent.is_dir() or parent.is_symlink():
@@ -345,7 +348,14 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
                 target.unlink()
                 removed += 1
             elif target.is_dir():
-                shutil.rmtree(target)
+                if directory_name in staging_dirs:
+                    for child in target.iterdir():
+                        if child.is_symlink() or child.is_file():
+                            child.unlink()
+                        elif child.is_dir():
+                            shutil.rmtree(child)
+                else:
+                    shutil.rmtree(target)
                 removed += 1
     return removed
 
