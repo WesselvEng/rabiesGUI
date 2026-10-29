@@ -3,9 +3,9 @@
 Two PySide6 GUIs are available for viewing BIDS subjects, checking NIfTI
 orientations, and creating or submitting RABIES SLURM jobs:
 
-- `rabies_subject_manager.py` creates one job per selected subject. Each
-  subject's sessions are processed together, and archived inputs retain their
-  `ses-*` folders.
+- `rabies_subject_manager.py` creates one independent job per BIDS session for
+  selected subjects. Each job runs preprocessing, confound correction, and
+  analysis for that session only.
 - `rabies_cohort_manager.py` creates one cohort-wide job for the full selected
   BIDS dataset, using RABIES' native subject/session handling.
 
@@ -15,7 +15,7 @@ system must also have `sbatch` available. For example:
 
 ```sh
 python -m pip install -r rabies_gui_requirements.txt
-# One job per selected subject
+# One job per BIDS session for selected subjects
 python rabies_subject_manager.py
 # One cohort-wide job
 python rabies_cohort_manager.py
@@ -33,9 +33,18 @@ paths with `<project root>/rabies_output/` and
 `<project root>/rabies_results/`; edit those fields afterward if needed.
 
 The instructions below describe the cohort-wide manager,
-`rabies_cohort_manager.py`. For independent per-subject jobs, launch
+`rabies_cohort_manager.py`. For independent per-session jobs, launch
 `rabies_subject_manager.py` instead and create/submit scripts for the selected
-subjects.
+subjects. It creates a separate `scrip_<subject>_<session>.sh` for each
+session, stages only that session's BOLD/T2w files, and writes stage outputs
+under `<output>/func_<stage>/<subject>/<session>/` and archived results under
+`<results>/<subject>/<session>/`. In the per-session manager, select session
+rows and choose **Clear selected session results** before submitting a session
+again. With no session rows selected, **Submit scripts with sbatch** submits
+eligible sessions for the selected subjects and skips sessions that already
+have archived results. If session rows are selected, it submits only those
+sessions for the current subject. Each session's analysis is independent; it
+does not combine data across sessions or subjects for group ICA.
 
 Set **Subject folder prefix** to the leading text shared by subject directory
 names. It defaults to `sub-` (for example, `sub-001`); change it to `mouse-`,
@@ -54,7 +63,8 @@ The subject window contains the subject table, stage status, script controls,
 cleanup actions, and cleaned-timeseries tools. It shows BOLD and T2w scan
 counts and the status of preprocessing, confound correction, and analysis.
 Select a subject to view its sessions, every NIfTI's orientation, whether the
-session input archive is present, and the cohort-wide stage results. Script
+session input archive is present, and the applicable session or cohort stage
+results. Script
 creation is allowed regardless of orientation, but job submission is blocked
 if any BIDS NIfTI is unreadable or is not in RAS orientation. Orientation
 entries show a concise session/modality label; hover over an entry to see its

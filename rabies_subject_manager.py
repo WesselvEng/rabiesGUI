@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browse BIDS subjects and generate/submit per-subject RABIES jobs."""
+"""Browse BIDS subjects and generate/submit per-session RABIES jobs."""
 
 from __future__ import annotations
 
@@ -64,13 +64,37 @@ def _workflow_path(directory: Path, stage: str) -> Path:
     return directory / f"rabies_{stage}_workflow.pkl"
 
 
-def subject_has_previous_results(subject: str, results_dir: Path) -> bool:
+def _session_result_name(session: str | None) -> str:
+    if session in (None, "No session"):
+        return "no-session"
+    if not session or Path(session).name != session or session in {".", ".."}:
+        raise ValueError(f"Invalid BIDS session name: {session!r}")
+    return session
+
+
+def subject_has_previous_results(
+    subject: str, results_dir: Path, session: str | None = None
+) -> bool:
     subject_results = results_dir / subject
+    if session is not None:
+        subject_results = subject_results / _session_result_name(session)
     if subject_results.is_dir() and any(subject_results.iterdir()):
         return True
     shared_cleaned = results_dir / "cleaned_timeseries"
-    return shared_cleaned.is_dir() and any(
-        path.name.startswith(f"{subject}_") for path in shared_cleaned.iterdir()
+    if not shared_cleaned.is_dir():
+        return False
+    prefix = f"{subject}_"
+    if session is None:
+        return any(path.name.startswith(prefix) for path in shared_cleaned.iterdir())
+    if session == "No session":
+        return any(
+            path.name.startswith(prefix) and "_ses-" not in path.name
+            for path in shared_cleaned.iterdir()
+        )
+    session_token = f"_{session}_"
+    return any(
+        path.name.startswith(prefix) and session_token in path.name
+        for path in shared_cleaned.iterdir()
     )
 
 
@@ -103,6 +127,46 @@ def clear_results(results_dir: Path, subjects: list[str] | None = None) -> int:
         elif target.is_dir():
             shutil.rmtree(target)
             removed += 1
+    return removed
+
+
+def clear_session_results(
+    results_dir: Path, subject: str, sessions: list[str]
+) -> int:
+    """Remove archived outputs and exported cleaned data for selected sessions."""
+    results_dir = results_dir.expanduser().resolve()
+    project_root = Path(__file__).resolve().parent
+    protected_paths = (Path.home().resolve(), project_root)
+    if (
+        any(results_dir == path or results_dir in path.parents for path in protected_paths)
+        or project_root in results_dir.parents
+    ):
+        raise ValueError(f"Refusing to remove contents of protected directory: {results_dir}")
+    if not subject or Path(subject).name != subject or subject in {".", ".."}:
+        raise ValueError(f"Invalid subject directory name: {subject!r}")
+
+    removed = 0
+    for session in sessions:
+        session_name = _session_result_name(session)
+        target = results_dir / subject / session_name
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+            removed += 1
+        elif target.is_dir():
+            shutil.rmtree(target)
+            removed += 1
+        cleaned_dir = results_dir / "cleaned_timeseries"
+        if cleaned_dir.is_dir():
+            token = f"_{session_name}_" if session_name != "no-session" else None
+            for path in cleaned_dir.iterdir():
+                if path.is_file() and path.name.startswith(f"{subject}_"):
+                    if (
+                        token in path.name
+                        if token is not None
+                        else "_ses-" not in path.name
+                    ):
+                        path.unlink()
+                        removed += 1
     return removed
 
 
@@ -156,12 +220,23 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
     return removed
 
 
-def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str, bool]:
+def stage_status(
+    subject: str,
+    output_dir: Path,
+    results_dir: Path,
+    session: str | None = None,
+) -> dict[str, bool]:
     """Report completed stages using RABIES' post-run workflow pickle files."""
     subject_output = output_dir / "func_preprocess" / subject
     confound_output = output_dir / "func_confound" / subject
     analysis_output = output_dir / "func_analysis" / subject
     subject_results = results_dir / subject
+    if session is not None:
+        session_name = _session_result_name(session)
+        subject_output /= session_name
+        confound_output /= session_name
+        analysis_output /= session_name
+        subject_results /= session_name
 
     preprocess_candidates = (
         _workflow_path(subject_output, "preprocess"),
@@ -251,7 +326,11 @@ def session_nifti_orientations(
     return sessions
 
 
-def nifti_orientation_issues(bids_dir: Path, subjects: list[str]) -> list[str]:
+def nifti_orientation_issues(
+    bids_dir: Path,
+    subjects: list[str],
+    selected_sessions: dict[str, set[str]] | None = None,
+) -> list[str]:
     """Return selected subjects' missing, unreadable, or non-RAS NIfTIs."""
     issues = []
     for subject in subjects:
@@ -263,6 +342,11 @@ def nifti_orientation_issues(bids_dir: Path, subjects: list[str]) -> list[str]:
         if not any(sessions.values()):
             issues.append(f"{subject}: no NIfTI files found.")
         for session, files in sessions.items():
+            if (
+                selected_sessions is not None
+                and session not in selected_sessions.get(subject, set())
+            ):
+                continue
             for path, orientation in files:
                 if orientation != "RAS":
                     session_dir = (
@@ -397,23 +481,23 @@ def move_cleaned_timeseries(subjects: list[str], results_dir: Path) -> tuple[lis
     skipped: list[Path] = []
 
     for subject in subjects:
-        source_dir = (
-            results_dir
-            / subject
-            / "confound"
-            / "confound_correction_datasink"
-            / "cleaned_timeseries"
-        )
-        if not source_dir.is_dir():
+        subject_results = results_dir / subject
+        if not subject_results.is_dir():
             continue
-        for source in sorted(source_dir.rglob("*_cleaned.nii.gz")):
-            destination = destination_dir / source.name
-            if destination.exists():
-                skipped.append(source)
-                continue
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(source), str(destination))
-            moved.append(destination)
+        source_dirs = sorted(
+            path
+            for path in subject_results.rglob("cleaned_timeseries")
+            if path.parent.name == "confound_correction_datasink"
+        )
+        for source_dir in source_dirs:
+            for source in sorted(source_dir.rglob("*_cleaned.nii.gz")):
+                destination = destination_dir / source.name
+                if destination.exists():
+                    skipped.append(source)
+                    continue
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+                moved.append(destination)
 
     return moved, skipped
 
@@ -439,6 +523,19 @@ def _session_name(path: Path, subject: str) -> str | None:
     return None
 
 
+def discover_session_files(
+    subject_dir: Path,
+) -> dict[str, tuple[list[Path], list[Path]]]:
+    """Group BOLD and T2w files by BIDS session for independent jobs."""
+    sessions: dict[str, tuple[list[Path], list[Path]]] = {}
+    for modality, suffix in (("func", "*_bold.nii.gz"), ("anat", "*_T2w.nii.gz")):
+        for path in sorted(subject_dir.rglob(suffix)):
+            session = _session_name(path, subject_dir.name) or "No session"
+            bold_files, anat_files = sessions.setdefault(session, ([], []))
+            (bold_files if modality == "func" else anat_files).append(path)
+    return dict(sorted(sessions.items()))
+
+
 def generate_subject_script(
     subject: str,
     bold_files: list[Path],
@@ -450,21 +547,42 @@ def generate_subject_script(
     preprocess_args: str = PREPROCESS_ARGS,
     confound_args: str = CONFOUND_ARGS,
     analysis_args: str = ANALYSIS_ARGS,
+    session: str | None = None,
 ) -> str:
-    """Build a resumable Bash job for one subject."""
+    """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
         raise ValueError(f"No *_bold.nii.gz files found for {subject}.")
     if not anat_files:
         raise ValueError(f"No *_T2w.nii.gz files found for {subject}.")
 
-    bids = output_dir / "tmp_bids" / subject
-    preprocess = output_dir / "func_preprocess" / subject
-    confound = output_dir / "func_confound" / subject
-    analysis = output_dir / "func_analysis" / subject
+    file_sessions = {
+        _session_name(path, subject)
+        for path in (*bold_files, *anat_files)
+    }
+    if session is None:
+        if len(file_sessions) > 1:
+            raise ValueError(
+                f"Files for {subject} span multiple sessions; generate one script per session."
+            )
+        selected_session = next(iter(file_sessions))
+    else:
+        selected_session = None if session == "No session" else session
+        if file_sessions != {selected_session}:
+            raise ValueError(
+                f"Files supplied for {subject} do not all belong to session {session}."
+            )
+    session_name = _session_result_name(
+        selected_session if selected_session is not None else "No session"
+    )
+    bids = output_dir / "tmp_bids" / subject / session_name
+    preprocess = output_dir / "func_preprocess" / subject / session_name
+    confound = output_dir / "func_confound" / subject / session_name
+    analysis = output_dir / "func_analysis" / subject / session_name
     result_subject = results_dir / subject
-    preprocess_archive = result_subject / "preprocess"
-    confound_archive = result_subject / "confound"
-    analysis_archive = result_subject / "analysis"
+    result_session = result_subject / session_name
+    preprocess_archive = result_session / "preprocess"
+    confound_archive = result_session / "confound"
+    analysis_archive = result_session / "analysis"
 
     templates = {
         "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
@@ -531,22 +649,17 @@ def generate_subject_script(
             lines.append(
                 f"cp -f {shlex.quote(str(path))} {shlex.quote(str(bids_directory))}/"
             )
-    sessions = sorted({
-        session
-        for path in (*bold_files, *anat_files)
-        if (session := _session_name(path, subject)) is not None
-    })
-
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
     confound_cli = confound / "rabies_confound_correction.pkl"
     analysis_workflow = _workflow_path(analysis, "analysis")
-    legacy_analysis_marker = result_subject / "analysis" / subject / "rabies_analysis.pkl"
+    legacy_analysis_marker = analysis_archive / subject / "rabies_analysis.pkl"
     lines.extend([
         "",
-        f"result_subject={shlex.quote(str(result_subject))}",
-        'if [[ -d "$result_subject" ]] && [[ -n "$(find "$result_subject" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then',
-        '  echo "Refusing to analyze $subject: previous results exist in $result_subject. Clear this subject\'s results in the GUI first." >&2',
+        f"session_name={shlex.quote(session_name)}",
+        f"result_session={shlex.quote(str(result_session))}",
+        'if [[ -d "$result_session" ]] && [[ -n "$(find "$result_session" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then',
+        '  echo "Refusing to analyze $subject session $session_name: previous results exist in $result_session. Clear this session\'s results in the GUI first." >&2',
         "  exit 1",
         "fi",
         f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
@@ -573,9 +686,9 @@ def generate_subject_script(
         f"  cp -f {shlex.quote(str(confound_workflow))} {shlex.quote(str(confound_archive))}/",
         f"  cp -f {shlex.quote(str(confound_cli))} {shlex.quote(str(confound_archive))}/",
         f"  cp -f {shlex.quote(str(confound / 'rabies_confound_correction.log'))} {shlex.quote(str(confound_archive))}/",
-        "  find \"$confound\" -mindepth 1 -delete",
         "fi",
-        f"if [[ -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+        f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+        f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
         f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
         f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
         f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
@@ -593,12 +706,21 @@ def generate_subject_script(
         "fi",
         "if [[ -d \"$confound\" ]]; then find \"$confound\" -mindepth 1 -delete; fi",
     ])
-    for session in sessions:
-        session_directory = bids / session
+    if selected_session is not None:
+        session_directory = bids / selected_session
+        session_archive = result_session
         lines.extend([
-            f"mkdir -p {shlex.quote(str(result_subject))}",
-            f"cp -a {shlex.quote(str(session_directory))} "
-            f"{shlex.quote(str(result_subject))}/",
+            f"mkdir -p {shlex.quote(str(session_archive))}",
+            f"cp -a {shlex.quote(str(session_directory))}/. "
+            f"{shlex.quote(str(session_archive))}/",
+        ])
+    else:
+        lines.extend([
+            f"mkdir -p {shlex.quote(str(result_session))}",
+            f"cp -a {shlex.quote(str(bids / 'func'))} "
+            f"{shlex.quote(str(result_session))}/",
+            f"cp -a {shlex.quote(str(bids / 'anat'))} "
+            f"{shlex.quote(str(result_session))}/",
         ])
     lines.extend(['echo "Finished subject $subject"', ""])
     return "\n".join(lines)
@@ -839,7 +961,7 @@ class SubjectManager(QMainWindow):
         self.setup_window = setup_window
         self.path_fields = setup_window.path_fields
         self.bids_folders = setup_window.bids_folders
-        self.setWindowTitle("RABIES Subject Manager")
+        self.setWindowTitle("RABIES Subject/Session Manager")
         self.resize(1180, 900)
         self.setMinimumSize(900, 740)
         self.stage_args = {
@@ -885,11 +1007,17 @@ class SubjectManager(QMainWindow):
             "Session",
             "NIfTI orientations",
             "Session archive",
-            "Subject preprocess",
-            "Subject confound",
-            "Subject analysis",
+            "Session preprocess",
+            "Session confound",
+            "Session analysis",
         ])
         self.session_details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.session_details.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.session_details.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.session_details.setWordWrap(True)
         self.session_details.setStyleSheet(
             "QToolTip { background-color: #ffffdc; color: #000000; "
@@ -930,6 +1058,7 @@ class SubjectManager(QMainWindow):
         cleanup_options.addWidget(QLabel("Archived results (permanent deletion):"))
         for label, callback in (
             ("Clear selected results", self.clear_selected_results),
+            ("Clear selected session results", self.clear_selected_session_results),
             ("Clear ALL results", self.clear_all_results),
         ):
             button = QPushButton(label)
@@ -946,7 +1075,9 @@ class SubjectManager(QMainWindow):
         cleanup_options.addStretch()
         layout.addLayout(cleanup_options)
 
-        self.status = QLabel("Select subjects to create or submit jobs.")
+        self.status = QLabel(
+            "Create or submit independent RABIES jobs for selected subject sessions."
+        )
         layout.addWidget(self.status)
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
@@ -998,16 +1129,35 @@ class SubjectManager(QMainWindow):
         try:
             self.subjects.setRowCount(len(discovered))
             for row, (subject, bold_count, anat_count) in enumerate(discovered):
-                states = stage_status(subject, output, results)
-                previous_results = subject_has_previous_results(subject, results)
+                session_files = discover_session_files(bids_dir / subject)
+                session_states = [
+                    stage_status(subject, output, results, session)
+                    for session in session_files
+                ]
+                states = {
+                    stage: [session[stage] for session in session_states]
+                    for stage in ("preprocess", "confound", "analysis")
+                }
+                previous_results = any(
+                    subject_has_previous_results(subject, results, session)
+                    for session in session_files
+                )
+
+                def status_text(values: list[bool]) -> str:
+                    if values and all(values):
+                        return "Complete"
+                    if any(values):
+                        return "Partial"
+                    return "Not found"
+
                 values = (
                     subject,
                     str(bold_count),
                     str(anat_count),
-                    "Complete" if states["preprocess"] else "Not found",
-                    "Complete" if states["confound"] else "Not found",
+                    status_text(states["preprocess"]),
+                    status_text(states["confound"]),
                     "Existing output (clear to rerun)" if previous_results else (
-                        "Complete" if states["analysis"] else "Not found"
+                        status_text(states["analysis"])
                     ),
                 )
                 for column, value in enumerate(values):
@@ -1042,7 +1192,10 @@ class SubjectManager(QMainWindow):
             return
         if not sessions:
             sessions = {"No session": []}
-        states = stage_status(subject, output, results)
+        session_states = {
+            session: stage_status(subject, output, results, session)
+            for session in sessions
+        }
         rows = [
             (session, path, orientation)
             for session, files in sessions.items()
@@ -1052,15 +1205,9 @@ class SubjectManager(QMainWindow):
             rows = [(session, None, "No NIfTI files found") for session in sessions]
         self.session_details.setRowCount(len(rows))
         for row, (session, path, orientation) in enumerate(rows):
-            archive = (
-                "Not applicable"
-                if session == "No session"
-                else (
-                    "Present"
-                    if (results / subject / session).is_dir()
-                    else "Not found"
-                )
-            )
+            result_session = results / subject / _session_result_name(session)
+            archive = "Present" if result_session.is_dir() else "Not found"
+            states = session_states[session]
             values = (
                 session,
                 (
@@ -1079,7 +1226,7 @@ class SubjectManager(QMainWindow):
                     item.setToolTip(str(path.resolve()))
                 self.session_details.setItem(row, column, item)
         self.session_details_label.setText(
-            f"Sessions for {subject} (stage results are subject-wide):"
+            f"Sessions for {subject} (stage results are session-specific):"
         )
 
     def select_all(self) -> None:
@@ -1138,8 +1285,16 @@ class SubjectManager(QMainWindow):
             QMessageBox.critical(self, "Output directory not set", "Choose a project root or set an output directory.")
             return
 
-        script_paths = [output / "tmp_script" / f"scrip_{subject}.sh" for subject in selected]
-        existing_paths = [path for path in script_paths if path.is_file()]
+        script_dir = output / "tmp_script"
+        existing_paths = [
+            path
+            for subject in selected
+            for path in (
+                *script_dir.glob(f"scrip_{subject}_*.sh"),
+                script_dir / f"scrip_{subject}.sh",
+            )
+            if path.is_file()
+        ]
         if not existing_paths:
             QMessageBox.information(self, "No scripts found", "No generated scripts exist for the selected subjects.")
             return
@@ -1168,6 +1323,51 @@ class SubjectManager(QMainWindow):
             )
             return
         self._clear_results(selected)
+
+    def clear_selected_session_results(self) -> None:
+        subject_item = self.subjects.item(self.subjects.currentRow(), 0)
+        sessions = sorted({
+            item.text()
+            for item in self.session_details.selectedItems()
+            if item.column() == 0
+        })
+        if subject_item is None or not sessions:
+            QMessageBox.information(
+                self,
+                "No sessions selected",
+                "Select one or more session rows in the session details table.",
+            )
+            return
+        _, _, results, _, _ = self._project_paths()
+        results_value = self.path_fields["results"].text().strip()
+        if not results_value:
+            QMessageBox.critical(
+                self, "Results directory not set",
+                "Choose a project root or set a results directory.",
+            )
+            return
+        subject = subject_item.text()
+        answer = QMessageBox.question(
+            self,
+            "Clear selected session results",
+            f"Permanently delete archived outputs and moved cleaned timeseries "
+            f"for {subject} ({', '.join(sessions)}) from {results}?\n"
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed = clear_session_results(results, subject, sessions)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, "Could not clear session results", str(error)
+            )
+            return
+        self.refresh_subjects()
+        self.status.setText(
+            f"Removed {removed} archived session result item(s) for {subject}."
+        )
 
     def clear_all_results(self) -> None:
         self._clear_results(None)
@@ -1427,19 +1627,6 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
-        blocked = [
-            subject for subject in selected
-            if subject_has_previous_results(subject, results)
-        ]
-        if blocked:
-            QMessageBox.critical(
-                self,
-                "Previous results must be cleared",
-                "Cannot create jobs for subjects with existing archived output:\n"
-                + "\n".join(blocked)
-                + "\nUse Clear selected results before rerunning them.",
-            )
-            return
         if not templates.is_dir():
             QMessageBox.critical(self, "Templates not found", f"Template directory does not exist: {templates}")
             return
@@ -1452,32 +1639,52 @@ class SubjectManager(QMainWindow):
             scripts = []
             for subject in selected:
                 subject_dir = bids_dir / subject
-                bold_files = sorted(subject_dir.rglob("*_bold.nii.gz"))
-                anat_files = sorted(subject_dir.rglob("*_T2w.nii.gz"))
-                script = generate_subject_script(
-                    subject,
-                    bold_files,
-                    anat_files,
-                    output,
-                    results,
-                    templates,
-                    image,
-                    preprocess_args=self.stage_args["Preprocessing"],
-                    confound_args=self.stage_args["Confound correction"],
-                    analysis_args=self.stage_args["Analysis"],
-                )
-                scripts.append((script_dir / f"scrip_{subject}.sh", script))
+                for session, (bold_files, anat_files) in discover_session_files(
+                    subject_dir
+                ).items():
+                    script = generate_subject_script(
+                        subject,
+                        bold_files,
+                        anat_files,
+                        output,
+                        results,
+                        templates,
+                        image,
+                        preprocess_args=self.stage_args["Preprocessing"],
+                        confound_args=self.stage_args["Confound correction"],
+                        analysis_args=self.stage_args["Analysis"],
+                        session=session,
+                    )
+                    session_name = _session_result_name(session)
+                    scripts.append((
+                        script_dir / f"scrip_{subject}_{session_name}.sh",
+                        script,
+                    ))
             for script_path, script in scripts:
                 script_path.write_text(script, encoding="utf-8")
                 script_path.chmod(0o755)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
-        self.status.setText(f"Created {len(selected)} script(s) in {script_dir}.")
-        QMessageBox.information(self, "Scripts created", f"Created scripts for {len(selected)} subject(s).")
+        self.status.setText(
+            f"Created {len(scripts)} session script(s) for "
+            f"{len(selected)} subject(s) in {script_dir}."
+        )
+        QMessageBox.information(
+            self, "Session scripts created",
+            f"Created {len(scripts)} session script(s) for {len(selected)} subject(s).",
+        )
 
     def submit_scripts(self) -> None:
         selected = self._selected_subjects()
+        selected_session_names = sorted({
+            item.text()
+            for item in self.session_details.selectedItems()
+            if item.column() == 0
+        })
+        current_subject_item = self.subjects.item(self.subjects.currentRow(), 0)
+        if selected_session_names and current_subject_item is not None:
+            selected = [current_subject_item.text()]
         if not selected:
             QMessageBox.information(self, "No subjects selected", "Select at least one subject first.")
             return
@@ -1495,8 +1702,15 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
+        session_filter = (
+            {selected[0]: set(selected_session_names)}
+            if selected_session_names
+            else None
+        )
         try:
-            orientation_issues = nifti_orientation_issues(bids_dir, selected)
+            orientation_issues = nifti_orientation_issues(
+                bids_dir, selected, session_filter
+            )
         except OSError as error:
             QMessageBox.critical(self, "Could not check NIfTI orientations", str(error))
             return
@@ -1509,32 +1723,64 @@ class SubjectManager(QMainWindow):
                 + "\n".join(orientation_issues),
             )
             return
-        blocked = [
-            subject for subject in selected
-            if subject_has_previous_results(subject, results)
-        ]
-        if blocked:
+        script_paths = []
+        blocked_sessions = []
+        missing = []
+        for subject in selected:
+            subject_sessions = discover_session_files(bids_dir / subject)
+            session_names = (
+                selected_session_names
+                if session_filter is not None
+                else subject_sessions
+            )
+            for session in session_names:
+                if session not in subject_sessions:
+                    missing.append(f"{subject}/{session}: no session files found")
+                    continue
+                session_name = _session_result_name(session)
+                script_path = (
+                    output / "tmp_script"
+                    / f"scrip_{subject}_{session_name}.sh"
+                )
+                if subject_has_previous_results(subject, results, session):
+                    blocked_sessions.append(f"{subject}/{session}")
+                elif script_path.is_file():
+                    script_paths.append(script_path)
+                else:
+                    missing.append(str(script_path))
+        if not script_paths and blocked_sessions:
             QMessageBox.critical(
                 self,
-                "Previous results must be cleared",
-                "Cannot submit jobs for subjects with existing archived output:\n"
-                + "\n".join(blocked)
-                + "\nUse Clear selected results before rerunning them.",
+                "Session results must be cleared",
+                "No session jobs can be submitted because archived results already "
+                "exist for the selected sessions:\n"
+                + "\n".join(blocked_sessions)
+                + "\nSelect those sessions and choose Clear selected session results to rerun them.",
             )
             return
-        script_paths = [output / "tmp_script" / f"scrip_{subject}.sh" for subject in selected]
-        missing = [str(path) for path in script_paths if not path.is_file()]
+        if not script_paths and not blocked_sessions and not missing:
+            QMessageBox.critical(
+                self, "No session jobs found",
+                "No BOLD/T2w session inputs were found for the selected subjects.",
+            )
+            return
         if missing:
             QMessageBox.critical(
                 self,
-                "Scripts not found",
-                "Create scripts for the selected subjects first:\n" + "\n".join(missing),
+                "Session scripts not found",
+                "Create scripts for the selected sessions first:\n" + "\n".join(missing),
             )
             return
         confirmation = QMessageBox.question(
             self,
-            "Submit jobs",
-            f"Submit {len(script_paths)} selected script(s) to SLURM with sbatch?",
+            "Submit session jobs",
+            f"Submit {len(script_paths)} session job(s) to SLURM with sbatch?"
+            + (
+                "\nExisting results will cause these sessions to be skipped:\n"
+                + "\n".join(blocked_sessions)
+                if blocked_sessions
+                else ""
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirmation != QMessageBox.StandardButton.Yes:
@@ -1554,8 +1800,17 @@ class SubjectManager(QMainWindow):
                 f"Submitted {len(submitted)} job(s) before the error.\n{details}",
             )
             return
-        self.status.setText(f"Submitted {len(submitted)} job(s) with sbatch.")
-        QMessageBox.information(self, "Jobs submitted", "\n".join(submitted))
+        skipped_text = (
+            f" Skipped {len(blocked_sessions)} session(s) with existing results."
+            if blocked_sessions
+            else ""
+        )
+        self.status.setText(
+            f"Submitted {len(submitted)} session job(s) with sbatch.{skipped_text}"
+        )
+        QMessageBox.information(
+            self, "Session jobs submitted", "\n".join(submitted) + skipped_text
+        )
 
 
 if __name__ == "__main__":

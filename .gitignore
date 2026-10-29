@@ -1,11 +1,7 @@
 *
 !.gitignore
 !README.md
-!RABIES/
-
-RABIES/*
-!RABIES/LICENSE
-
 !rabies_subject_manager.py
 !rabies_cohort_manager.py
 !rabies_gui_requirements.txt
+!LICENSE

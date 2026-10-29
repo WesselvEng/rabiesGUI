@@ -960,7 +960,7 @@ class SubjectManager(QMainWindow):
         self.setup_window = setup_window
         self.path_fields = setup_window.path_fields
         self.bids_folders = setup_window.bids_folders
-        self.setWindowTitle("RABIES Subject Manager")
+        self.setWindowTitle("RABIES Cohort Manager")
         self.resize(1180, 900)
         self.setMinimumSize(900, 740)
         self.stage_args = {
