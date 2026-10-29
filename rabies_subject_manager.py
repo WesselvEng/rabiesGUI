@@ -13,6 +13,8 @@ from pathlib import Path
 
 import nibabel as nib
 from nibabel.filebasedimages import ImageFileError
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -58,6 +60,122 @@ ANALYSIS_ARGS = (
     "--prior_bold_idx 0 1 3 5 7 8 9 10 11 15 17 18 "
     "--prior_confound_idx 2 4 6 12 13 14 16 19"
 )
+
+DARK_STYLE = """
+QWidget {
+    background-color: #202124;
+    color: #e8eaed;
+    selection-background-color: #4c8bf5;
+    selection-color: #ffffff;
+}
+QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox {
+    background-color: #292a2d;
+    border: 1px solid #5f6368;
+    border-radius: 4px;
+    padding: 5px;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus {
+    border: 1px solid #8ab4f8;
+}
+QPushButton, QToolButton {
+    background-color: #34363a;
+    border: 1px solid #5f6368;
+    border-radius: 4px;
+    padding: 6px 10px;
+}
+QPushButton:hover, QToolButton:hover {
+    background-color: #45484d;
+}
+QPushButton:pressed, QToolButton:pressed {
+    background-color: #2b4d7e;
+}
+QPushButton:disabled, QToolButton:disabled {
+    color: #80868b;
+    background-color: #292a2d;
+}
+QTableWidget, QTableView, QTreeView, QListView {
+    background-color: #202124;
+    alternate-background-color: #292a2d;
+    gridline-color: #3c4043;
+    border: 1px solid #3c4043;
+}
+QHeaderView::section {
+    background-color: #303134;
+    color: #e8eaed;
+    border: 1px solid #3c4043;
+    padding: 5px;
+}
+QTabWidget::pane {
+    border: 1px solid #5f6368;
+}
+QTabBar::tab {
+    background-color: #303134;
+    border: 1px solid #5f6368;
+    padding: 6px 10px;
+}
+QTabBar::tab:selected {
+    background-color: #45484d;
+}
+QMenu, QMenuBar {
+    background-color: #292a2d;
+    color: #e8eaed;
+}
+QMenu::item:selected {
+    background-color: #3c4043;
+}
+QToolTip {
+    background-color: #ffffdc;
+    color: #000000;
+    border: 1px solid #767676;
+    padding: 2px;
+}
+QScrollBar:vertical {
+    background: #202124;
+    width: 12px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #5f6368;
+    min-height: 24px;
+    border-radius: 5px;
+}
+QScrollBar:horizontal {
+    background: #202124;
+    height: 12px;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: #5f6368;
+    min-width: 24px;
+    border-radius: 5px;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+}
+"""
+
+
+def configure_dark_mode(application: QApplication) -> None:
+    """Apply a consistent dark palette and Fusion styling to the GUI."""
+    application.setStyle("Fusion")
+    palette = application.palette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#e8eaed"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#292a2d"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#303134"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffdc"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#e8eaed"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#34363a"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e8eaed"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#4c8bf5"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Link, QColor("#8ab4f8"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#9aa0a6"))
+    application.setPalette(palette)
+    application.setStyleSheet(DARK_STYLE)
 
 
 def _workflow_path(directory: Path, stage: str) -> Path:
@@ -1814,7 +1932,9 @@ class SubjectManager(QMainWindow):
 
 
 if __name__ == "__main__":
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication([])
+    configure_dark_mode(app)
     window = ProjectSetupWindow()
     window.show()
     app.exec()
