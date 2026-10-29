@@ -289,7 +289,13 @@ def clear_session_results(
 
 
 def output_subject_names(output_dir: Path) -> set[str]:
-    subject_dirs = ("tmp_bids", "func_preprocess", "func_confound", "func_analysis")
+    subject_dirs = (
+        "tmp_bids",
+        "tmp_bids_session",
+        "func_preprocess",
+        "func_confound",
+        "func_analysis",
+    )
     return {
         entry.name
         for directory_name in subject_dirs
@@ -313,7 +319,13 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
     if not output_dir.is_dir():
         return 0
 
-    subject_dirs = ("tmp_bids", "func_preprocess", "func_confound", "func_analysis")
+    subject_dirs = (
+        "tmp_bids",
+        "tmp_bids_session",
+        "func_preprocess",
+        "func_confound",
+        "func_analysis",
+    )
     if subjects is None:
         subject_names = output_subject_names(output_dir)
     else:
@@ -692,12 +704,13 @@ def generate_subject_script(
     session_name = _session_result_name(
         selected_session if selected_session is not None else "No session"
     )
-    bids = output_dir / "tmp_bids" / subject / session_name
+    bids = output_dir / "tmp_bids_session" / subject / session_name
     preprocess = output_dir / "func_preprocess" / subject / session_name
     confound = output_dir / "func_confound" / subject / session_name
     analysis = output_dir / "func_analysis" / subject / session_name
     result_subject = results_dir / subject
     result_session = result_subject / session_name
+    session_archive = result_session / "input_bids"
     preprocess_archive = result_session / "preprocess"
     confound_archive = result_session / "confound"
     analysis_archive = result_session / "analysis"
@@ -749,24 +762,35 @@ def generate_subject_script(
         "#SBATCH --cpus-per-task=2",
         "set -euo pipefail",
         f"subject={shlex.quote(subject)}",
+        f"session_name={shlex.quote(session_name)}",
         f"bids={shlex.quote(str(bids))}",
+        f"bids_parent={shlex.quote(str(bids.parent))}",
         f"preprocess={shlex.quote(str(preprocess))}",
         f"confound={shlex.quote(str(confound))}",
         f"analysis={shlex.quote(str(analysis))}",
+        f"session_archive={shlex.quote(str(session_archive))}",
         f"preprocess_archive={shlex.quote(str(preprocess_archive))}",
         f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis_archive={shlex.quote(str(analysis_archive))}",
-        'mkdir -p "$bids" "$preprocess" "$confound" "$analysis"',
+        'mkdir -p "$bids_parent" "$preprocess" "$confound" "$analysis"',
+        'bids_staging=$(mktemp -d "$bids_parent/.${session_name}.XXXXXX")',
+        'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
     ]
     for paths, modality in ((bold_files, "func"), (anat_files, "anat")):
         for path in paths:
-            session = _session_name(path, subject)
-            relative_directory = Path(session) / modality if session else Path(modality)
-            bids_directory = bids / relative_directory
-            lines.append(f"mkdir -p {shlex.quote(str(bids_directory))}")
+            lines.append(f'mkdir -p "$bids_staging/{modality}"')
             lines.append(
-                f"cp -f {shlex.quote(str(path))} {shlex.quote(str(bids_directory))}/"
+                f"cp -f {shlex.quote(str(path))} \"$bids_staging/{modality}/\""
             )
+    lines.extend([
+        'if [[ -L "$bids" ]]; then',
+        '  echo "Refusing to replace symlinked session input directory: $bids" >&2',
+        "  exit 1",
+        "fi",
+        'if [[ -e "$bids" ]]; then rm -rf -- "$bids"; fi',
+        'mv "$bids_staging" "$bids"',
+        'bids_staging=""',
+    ])
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
     confound_cli = confound / "rabies_confound_correction.pkl"
@@ -774,7 +798,6 @@ def generate_subject_script(
     legacy_analysis_marker = analysis_archive / subject / "rabies_analysis.pkl"
     lines.extend([
         "",
-        f"session_name={shlex.quote(session_name)}",
         f"result_session={shlex.quote(str(result_session))}",
         'if [[ -d "$result_session" ]] && [[ -n "$(find "$result_session" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then',
         '  echo "Refusing to analyze $subject session $session_name: previous results exist in $result_session. Clear this session\'s results in the GUI first." >&2',
@@ -824,22 +847,10 @@ def generate_subject_script(
         "fi",
         "if [[ -d \"$confound\" ]]; then find \"$confound\" -mindepth 1 -delete; fi",
     ])
-    if selected_session is not None:
-        session_directory = bids / selected_session
-        session_archive = result_session
-        lines.extend([
-            f"mkdir -p {shlex.quote(str(session_archive))}",
-            f"cp -a {shlex.quote(str(session_directory))}/. "
-            f"{shlex.quote(str(session_archive))}/",
-        ])
-    else:
-        lines.extend([
-            f"mkdir -p {shlex.quote(str(result_session))}",
-            f"cp -a {shlex.quote(str(bids / 'func'))} "
-            f"{shlex.quote(str(result_session))}/",
-            f"cp -a {shlex.quote(str(bids / 'anat'))} "
-            f"{shlex.quote(str(result_session))}/",
-        ])
+    lines.extend([
+        'mkdir -p "$session_archive"',
+        'cp -a "$bids/." "$session_archive/"',
+    ])
     lines.extend(['echo "Finished subject $subject"', ""])
     return "\n".join(lines)
 
