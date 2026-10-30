@@ -1,14 +1,15 @@
 # RABIES subject and cohort managers
 
 Two PySide6 GUIs are available for viewing BIDS subjects, checking NIfTI
-orientations, and creating or submitting RABIES SLURM jobs:
+orientations, and creating or submitting RABIES/FIXRABIES SLURM jobs:
 
 - `rabies_subject_manager.py` creates one independent job per BIDS session for
   selected subjects. It creates preprocessing-only,
-  preprocessing-plus-confound, and full-pipeline variants for each session.
+  preprocessing-plus-confound, full-pipeline, and preprocessing-plus-FIXRABIES
+  prepare variants for each session.
 - `rabies_cohort_manager.py` creates one cohort-wide job for the full selected
   BIDS dataset, using RABIES' native subject/session handling, with the same
-  three pipeline variants.
+  four pipeline variants.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -27,6 +28,14 @@ scripts, workflow outputs, and archived stage results use separate paths;
 both modes use the shared `cleaned_timeseries` folder when files are moved
 there.
 
+FIXRABIES scripts call the `fixrabies` command directly, so FIXRABIES and its
+required FSL/FIX dependencies must be available in the job's environment.
+Choose the FIX species/template space from the dropdown beside the pipeline
+selector: `ratSIGMA`, `mouseDSURQE`, or `mouseAIBS`. See the upstream
+[FIXRABIES installation instructions](https://github.com/grandjeanlab/FixRABIES#installation).
+The selected FIXRABIES species must match the common-space template used for
+RABIES preprocessing; adjust the RABIES arguments when using a non-rat space.
+
 The GUI opens in the **RABIES Project Setup** window. Browse to the project
 root, output directory, results directory, RABIES image, and template folder
 (rat, mouse, or custom). Choosing a project root fills the output and results
@@ -42,10 +51,11 @@ The instructions below describe the cohort-wide manager,
 subjects. It creates a separate `scrip_<subject>_<session>.sh` for each
 session for the pipeline selected in the dropdown next to **Create script**.
 Scripts are saved under
-`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`. Each
+`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare}/`. Each
 script stages only that session's BOLD/T2w files and writes stage outputs under
 `<output>/func_<stage>/<subject>/<session>/` and archived results under
-`<results>/<subject>/<session>/`. Choose **Submit scripts with sbatch** and
+`<results>/<subject>/<session>/`; FIXRABIES prepare outputs are written to
+`<results>/<subject>/<session>/fixrabies/`. Choose **Submit scripts with sbatch** and
 select which pipeline variant to submit. With no session rows selected, it
 submits eligible sessions for the selected subjects and skips sessions that
 already have results for that pipeline's stages. If session rows are selected,
@@ -69,7 +79,8 @@ setup window and apply different paths.
 
 The subject window contains the subject table, stage status, script controls,
 cleanup actions, and cleaned-timeseries tools. It shows BOLD and T2w scan
-counts and the status of preprocessing, confound correction, and analysis.
+counts and the status of preprocessing, confound correction, analysis, and
+FIXRABIES preparation.
 Select a subject to view its sessions, every NIfTI's orientation, whether the
 session input archive is present, and the applicable session or cohort stage
 results. Script
@@ -83,26 +94,29 @@ replaces the input files with RAS-oriented copies. If a cohort input snapshot
 already exists, clear all results before changing orientations so the archived
 inputs and stage outputs cannot become inconsistent.
 
-Stage status is based on the corresponding
-`rabies_<stage>_workflow.pkl` file. RABIES writes this workflow pickle after a
-stage completes. The three stage markers under
-`<results directory>/cohort/{preprocess,confound,analysis}/` reflect progress
-for the entire BIDS dataset and are shown for every subject row.
+RABIES stage status is based on the corresponding
+`rabies_<stage>_workflow.pkl` file. FIXRABIES status is based on prepared scan
+directories under `<results directory>/cohort/fixrabies/data/`. Status is
+cohort-wide and is shown for every subject row.
 
 Choose the pipeline in the dropdown next to **Create script**, then create the
 cohort script under
-`<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`.
+`<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare}/`.
 Choose **Submit cohort with sbatch** to submit the currently selected variant
 as one job for every subject and session in the selected BIDS folder.
-Selection in the subject table is only for viewing subject details and reorienting selected
-files; it does not narrow the analysis cohort. Each script runs preprocessing
-only, preprocessing followed by confound correction, or the whole pipeline
-(including analysis). Each script preserves the complete BIDS tree in the
-cohort archive, then passes
-that archived BIDS root to RABIES, which discovers and pairs subject/session
-scans using its native BIDS handling. Its `MultiProc` workflows
-run preprocessing, confound correction, and analysis once across the dataset,
-including the configured group ICA, instead of repeating the full pipeline
+Selection in the subject table is only for viewing subject details and
+reorienting selected files; it does not narrow the analysis cohort. Each
+script runs preprocessing only, preprocessing followed by confound correction,
+the whole RABIES pipeline (including analysis), or preprocessing followed by
+`fixrabies prepare`. For FIXRABIES, the selected species/template space is
+passed to the prepare command, which converts the RABIES preprocessing outputs
+into FIX-compatible scan directories under
+`<results directory>/cohort/fixrabies/data/`, then runs MELODIC and extracts
+FIX features. Each script preserves the complete BIDS tree in the cohort
+archive, then passes that archived BIDS root to RABIES, which discovers and
+pairs subject/session scans using its native BIDS handling. RABIES runs the
+selected preprocessing and analysis stages once across the dataset, including
+the configured group ICA for the full pipeline, instead of repeating them
 separately for each subject. Results and workflow markers remain under
 `<results directory>/cohort/`, allowing a rerun of the script to skip completed
 stages and resume incomplete ones. Before the first stage, the job copies the

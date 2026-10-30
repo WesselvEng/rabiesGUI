@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browse BIDS subjects and generate/submit cohort-wide RABIES jobs."""
+"""Browse BIDS subjects and generate/submit cohort-wide RABIES/FIXRABIES jobs."""
 
 from __future__ import annotations
 
@@ -45,7 +45,9 @@ PIPELINE_VARIANTS = (
     ("Preprocessing only", "preproc_only"),
     ("Preprocessing + confound correction", "preproc_confound"),
     ("Whole pipeline", "whole_pipeline"),
+    ("Preprocessing + FIXRABIES prepare", "fixrabies_prepare"),
 )
+FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -317,14 +319,16 @@ def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str,
 
 
 def cohort_stage_status(results_dir: Path) -> dict[str, bool]:
-    """Report completion markers for the shared full-dataset RABIES run."""
+    """Report completion markers for cohort-wide RABIES and FIXRABIES stages."""
     cohort_dir = results_dir / "cohort"
+    fix_data = cohort_dir / "fixrabies" / "data"
     return {
         "preprocess": _workflow_path(cohort_dir / "preprocess", "preprocess").is_file(),
         "confound": _workflow_path(
             cohort_dir / "confound", "confound_correction"
         ).is_file(),
         "analysis": _workflow_path(cohort_dir / "analysis", "analysis").is_file(),
+        "fixrabies": fix_data.is_dir() and any(fix_data.iterdir()),
     }
 
 
@@ -589,8 +593,9 @@ def generate_cohort_script(
     confound_args: str = CONFOUND_ARGS,
     analysis_args: str = ANALYSIS_ARGS,
     pipeline: str = "whole_pipeline",
+    fix_species: str = "ratSIGMA",
 ) -> str:
-    """Build one resumable RABIES job for all subjects and sessions in a BIDS dataset."""
+    """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
     cohort_dir = (results_dir / "cohort").expanduser().resolve()
     if bids_dir == cohort_dir or bids_dir in cohort_dir.parents:
@@ -602,10 +607,13 @@ def generate_cohort_script(
         raise ValueError(f"No BIDS subjects found in {bids_dir}.")
     if pipeline not in {variant for _, variant in PIPELINE_VARIANTS}:
         raise ValueError(f"Unknown pipeline variant: {pipeline}")
+    if fix_species not in FIXRABIES_SPECIES:
+        raise ValueError(f"Unsupported FIXRABIES species: {fix_species}")
 
     preprocess = cohort_dir / "preprocess"
     confound = cohort_dir / "confound"
     analysis = cohort_dir / "analysis"
+    fix_dir = cohort_dir / "fixrabies"
     archived_bids = cohort_dir / "input_bids"
     templates = {
         "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
@@ -649,6 +657,13 @@ def generate_cohort_script(
         "analysis",
         "/confound_correction_outputs/", "/analysis_outputs/",
     ] + shlex.split(_expand_template_paths(analysis_args, templates))
+    fix_prepare_command = [
+        "fixrabies", "prepare",
+        "-preprocess_dir", str(preprocess),
+        "-fix_dir", str(fix_dir),
+        "-species", fix_species,
+        "-nipype", '{"plugin":"MultiProc","n_procs":8}',
+    ]
 
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
@@ -663,6 +678,7 @@ def generate_cohort_script(
         f"preprocess={shlex.quote(str(preprocess))}",
         f"confound={shlex.quote(str(confound))}",
         f"analysis={shlex.quote(str(analysis))}",
+        f"fix_dir={shlex.quote(str(fix_dir))}",
         f"bids_source={shlex.quote(str(bids_dir))}",
         f"archived_bids={shlex.quote(str(archived_bids))}",
         'mkdir -p "$cohort" "$preprocess"',
@@ -677,6 +693,8 @@ def generate_cohort_script(
         lines.append('mkdir -p "$confound"')
     if pipeline == "whole_pipeline":
         lines.append('mkdir -p "$analysis"')
+    if pipeline == "fixrabies_prepare":
+        lines.append('mkdir -p "$fix_dir"')
     lines.extend([
         f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
         "  " + _shell_command(preprocess_command),
@@ -692,6 +710,26 @@ def generate_cohort_script(
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
             "  " + _shell_command(analysis_command),
+            "fi",
+        ])
+    if pipeline == "fixrabies_prepare":
+        fix_data = fix_dir / "data"
+        fix_marker = fix_dir / ".prepare_complete"
+        lines.extend([
+            f"if [[ -d {shlex.quote(str(fix_data))} "
+            f"&& -n \"$(find {shlex.quote(str(fix_data))} -mindepth 1 "
+            f"-maxdepth 1 -print -quit)\" "
+            f"&& ! -f {shlex.quote(str(fix_marker))} ]]; then",
+            '  echo "Existing FIXRABIES data found; clear cohort results before preparing again." >&2',
+            "  exit 1",
+            "fi",
+            f"if [[ ! -f {shlex.quote(str(fix_marker))} ]]; then",
+            '  if ! command -v fixrabies >/dev/null 2>&1; then',
+            '    echo "FIXRABIES CLI (fixrabies) is not available on PATH in this job environment." >&2',
+            "    exit 127",
+            "  fi",
+            "  " + _shell_command(fix_prepare_command),
+            f"  touch {shlex.quote(str(fix_marker))}",
             "fi",
         ])
     lines.extend([
@@ -1137,11 +1175,12 @@ class SubjectManager(QMainWindow):
         project_options.addWidget(project_settings)
         layout.addLayout(project_options)
 
-        self.subjects = QTableWidget(0, 6)
+        self.subjects = QTableWidget(0, 7)
         self.subjects.setHorizontalHeaderLabels(
             [
                 "Subject", "BOLD scans", "T2w scans",
                 "Cohort preprocess", "Cohort confound", "Cohort analysis",
+                "FIXRABIES prepare",
             ]
         )
         self.subjects.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1156,7 +1195,7 @@ class SubjectManager(QMainWindow):
 
         self.session_details_label = QLabel("Session details: select a subject.")
         layout.addWidget(self.session_details_label)
-        self.session_details = QTableWidget(0, 6)
+        self.session_details = QTableWidget(0, 7)
         self.session_details.setHorizontalHeaderLabels([
             "Session",
             "NIfTI orientations",
@@ -1164,6 +1203,7 @@ class SubjectManager(QMainWindow):
             "Subject preprocess",
             "Subject confound",
             "Subject analysis",
+            "FIXRABIES prepare",
         ])
         self.session_details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.session_details.setWordWrap(True)
@@ -1203,6 +1243,19 @@ class SubjectManager(QMainWindow):
         for label, pipeline in PIPELINE_VARIANTS:
             self.pipeline_selector.addItem(label, pipeline)
         options.addWidget(self.pipeline_selector)
+        options.addWidget(QLabel("FIX species:"))
+        self.fix_species_selector = QComboBox()
+        self.fix_species_selector.addItems(FIXRABIES_SPECIES)
+        self.fix_species_selector.setToolTip(
+            "Choose the FIXRABIES species that matches the RABIES common-space template."
+        )
+        self.fix_species_selector.setEnabled(False)
+        self.pipeline_selector.currentIndexChanged.connect(
+            lambda _index: self.fix_species_selector.setEnabled(
+                self.pipeline_selector.currentData() == "fixrabies_prepare"
+            )
+        )
+        options.addWidget(self.fix_species_selector)
         create_scripts = QPushButton("Create script")
         create_scripts.clicked.connect(self.create_scripts)
         options.addWidget(create_scripts)
@@ -1229,7 +1282,7 @@ class SubjectManager(QMainWindow):
         layout.addLayout(cleanup_options)
 
         self.status = QLabel(
-            "Create or submit one RABIES job for all subjects in the selected BIDS folder."
+            "Create or submit one pipeline job for all subjects in the selected BIDS folder."
         )
         layout.addWidget(self.status)
 
@@ -1293,6 +1346,7 @@ class SubjectManager(QMainWindow):
                     "Complete" if states["analysis"] else (
                         "Legacy output" if previous_results else "Not found"
                     ),
+                    "Complete" if states["fixrabies"] else "Not found",
                 )
                 for column, value in enumerate(values):
                     self.subjects.setItem(
@@ -1359,6 +1413,7 @@ class SubjectManager(QMainWindow):
                 "Complete" if states["preprocess"] else "Not found",
                 "Complete" if states["confound"] else "Not found",
                 "Complete" if states["analysis"] else "Not found",
+                "Complete" if states["fixrabies"] else "Not found",
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1435,7 +1490,7 @@ class SubjectManager(QMainWindow):
             self,
             "Remove cohort scripts",
             f"Remove all {len(existing_paths)} generated cohort script(s)? "
-            "This does not remove RABIES outputs.",
+            "This does not remove processing outputs.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -1744,6 +1799,7 @@ class SubjectManager(QMainWindow):
                 confound_args=self.stage_args["Confound correction"],
                 analysis_args=self.stage_args["Analysis"],
                 pipeline=pipeline,
+                fix_species=self.fix_species_selector.currentText(),
             )
             script_path = script_root / pipeline / "scrip_cohort.sh"
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1847,7 +1903,7 @@ class SubjectManager(QMainWindow):
         confirmation = QMessageBox.question(
             self,
             "Submit cohort job",
-            f"Submit one {pipeline_label.lower()} RABIES job for all "
+            f"Submit one {pipeline_label.lower()} job for all "
             f"{len(subjects)} subject(s) in "
             f"{bids_dir} with sbatch? The job archives the full BIDS dataset "
             f"under {results / 'cohort' / 'input_bids'} before processing.",

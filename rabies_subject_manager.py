@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browse BIDS subjects and generate/submit per-session RABIES jobs."""
+"""Browse BIDS subjects and generate/submit per-session RABIES/FIXRABIES jobs."""
 
 from __future__ import annotations
 
@@ -47,7 +47,9 @@ PIPELINE_VARIANTS = (
     ("Preprocessing only", "preproc_only"),
     ("Preprocessing + confound correction", "preproc_confound"),
     ("Whole pipeline", "whole_pipeline"),
+    ("Preprocessing + FIXRABIES prepare", "fixrabies_prepare"),
 )
+FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -231,6 +233,7 @@ def pipeline_has_previous_results(
         "preproc_only": ("preprocess", "confound", "analysis"),
         "preproc_confound": ("confound", "analysis"),
         "whole_pipeline": ("analysis",),
+        "fixrabies_prepare": ("fixrabies",),
     }[pipeline]
     if any(
         (stage_results := session_results / stage).is_dir()
@@ -405,7 +408,7 @@ def stage_status(
     results_dir: Path,
     session: str | None = None,
 ) -> dict[str, bool]:
-    """Report completed stages using RABIES' post-run workflow pickle files."""
+    """Report completed RABIES stages and FIXRABIES prepared scan output."""
     subject_output = output_dir / "func_preprocess" / subject
     confound_output = output_dir / "func_confound" / subject
     analysis_output = output_dir / "func_analysis" / subject
@@ -431,10 +434,12 @@ def stage_status(
         _workflow_path(subject_results / "analysis" / subject, "analysis"),
         subject_results / "analysis" / subject / "rabies_analysis.pkl",
     )
+    fix_data = subject_results / "fixrabies" / "data"
     return {
         "preprocess": any(path.is_file() for path in preprocess_candidates),
         "confound": any(path.is_file() for path in confound_candidates),
         "analysis": any(path.is_file() for path in analysis_candidates),
+        "fixrabies": fix_data.is_dir() and any(fix_data.iterdir()),
     }
 
 
@@ -728,6 +733,7 @@ def generate_subject_script(
     analysis_args: str = ANALYSIS_ARGS,
     session: str | None = None,
     pipeline: str = "whole_pipeline",
+    fix_species: str = "ratSIGMA",
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
@@ -736,6 +742,8 @@ def generate_subject_script(
         raise ValueError(f"No *_T2w.nii.gz files found for {subject}.")
     if pipeline not in {variant for _, variant in PIPELINE_VARIANTS}:
         raise ValueError(f"Unknown pipeline variant: {pipeline}")
+    if fix_species not in FIXRABIES_SPECIES:
+        raise ValueError(f"Unsupported FIXRABIES species: {fix_species}")
 
     file_sessions = {
         _session_name(path, subject)
@@ -766,6 +774,7 @@ def generate_subject_script(
     preprocess_archive = result_session / "preprocess"
     confound_archive = result_session / "confound"
     analysis_archive = result_session / "analysis"
+    fix_dir = result_session / "fixrabies"
 
     templates = {
         "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
@@ -807,6 +816,13 @@ def generate_subject_script(
         str(rabies_image), "-f", "-p", "MultiProc", "analysis",
         "/confound_correction_outputs/", "/analysis_outputs/",
     ] + shlex.split(_expand_template_paths(analysis_args, templates))
+    fix_prepare_command = [
+        "fixrabies", "prepare",
+        "-preprocess_dir", str(preprocess),
+        "-fix_dir", str(fix_dir),
+        "-species", fix_species,
+        "-nipype", '{"plugin":"MultiProc","n_procs":4}',
+    ]
 
     lines = [
         "#!/usr/bin/env bash",
@@ -890,6 +906,27 @@ def generate_subject_script(
             f"  cp -f {shlex.quote(str(confound_workflow))} {shlex.quote(str(confound_archive))}/",
             f"  cp -f {shlex.quote(str(confound_cli))} {shlex.quote(str(confound_archive))}/",
             f"  cp -f {shlex.quote(str(confound / 'rabies_confound_correction.log'))} {shlex.quote(str(confound_archive))}/",
+            "fi",
+        ])
+    if pipeline == "fixrabies_prepare":
+        fix_data = fix_dir / "data"
+        fix_marker = fix_dir / ".prepare_complete"
+        lines.extend([
+            f"mkdir -p {shlex.quote(str(fix_dir))}",
+            f"if [[ -d {shlex.quote(str(fix_data))} "
+            f"&& -n \"$(find {shlex.quote(str(fix_data))} -mindepth 1 "
+            f"-maxdepth 1 -print -quit)\" "
+            f"&& ! -f {shlex.quote(str(fix_marker))} ]]; then",
+            '  echo "Existing FIXRABIES data found; clear this session\'s results before preparing again." >&2',
+            "  exit 1",
+            "fi",
+            f"if [[ ! -f {shlex.quote(str(fix_marker))} ]]; then",
+            '  if ! command -v fixrabies >/dev/null 2>&1; then',
+            '    echo "FIXRABIES CLI (fixrabies) is not available on PATH in this job environment." >&2',
+            "    exit 127",
+            "  fi",
+            f"  {_shell_command(fix_prepare_command)}",
+            f"  touch {shlex.quote(str(fix_marker))}",
             "fi",
         ])
     if pipeline == "whole_pipeline":
@@ -1183,9 +1220,9 @@ class SubjectManager(QMainWindow):
         project_options.addWidget(project_settings)
         layout.addLayout(project_options)
 
-        self.subjects = QTableWidget(0, 6)
+        self.subjects = QTableWidget(0, 7)
         self.subjects.setHorizontalHeaderLabels(
-            ["Subject", "BOLD scans", "T2w scans", "Preprocess", "Confound", "Analysis"]
+            ["Subject", "BOLD scans", "T2w scans", "Preprocess", "Confound", "Analysis", "FIXRABIES"]
         )
         self.subjects.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.subjects.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1199,7 +1236,7 @@ class SubjectManager(QMainWindow):
 
         self.session_details_label = QLabel("Session details: select a subject.")
         layout.addWidget(self.session_details_label)
-        self.session_details = QTableWidget(0, 6)
+        self.session_details = QTableWidget(0, 7)
         self.session_details.setHorizontalHeaderLabels([
             "Session",
             "NIfTI orientations",
@@ -1207,6 +1244,7 @@ class SubjectManager(QMainWindow):
             "Session preprocess",
             "Session confound",
             "Session analysis",
+            "Session FIXRABIES",
         ])
         self.session_details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.session_details.setSelectionBehavior(
@@ -1252,6 +1290,19 @@ class SubjectManager(QMainWindow):
         for label, pipeline in PIPELINE_VARIANTS:
             self.pipeline_selector.addItem(label, pipeline)
         options.addWidget(self.pipeline_selector)
+        options.addWidget(QLabel("FIX species:"))
+        self.fix_species_selector = QComboBox()
+        self.fix_species_selector.addItems(FIXRABIES_SPECIES)
+        self.fix_species_selector.setToolTip(
+            "Choose the FIXRABIES species that matches the RABIES common-space template."
+        )
+        self.fix_species_selector.setEnabled(False)
+        self.pipeline_selector.currentIndexChanged.connect(
+            lambda _index: self.fix_species_selector.setEnabled(
+                self.pipeline_selector.currentData() == "fixrabies_prepare"
+            )
+        )
+        options.addWidget(self.fix_species_selector)
         create_scripts = QPushButton("Create script")
         create_scripts.clicked.connect(self.create_scripts)
         options.addWidget(create_scripts)
@@ -1279,7 +1330,7 @@ class SubjectManager(QMainWindow):
         layout.addLayout(cleanup_options)
 
         self.status = QLabel(
-            "Create or submit independent RABIES jobs for selected subject sessions."
+            "Create or submit independent pipeline jobs for selected subject sessions."
         )
         layout.addWidget(self.status)
 
@@ -1339,7 +1390,7 @@ class SubjectManager(QMainWindow):
                 ]
                 states = {
                     stage: [session[stage] for session in session_states]
-                    for stage in ("preprocess", "confound", "analysis")
+                    for stage in ("preprocess", "confound", "analysis", "fixrabies")
                 }
                 previous_results = any(
                     subject_has_previous_results(subject, results, session)
@@ -1362,6 +1413,7 @@ class SubjectManager(QMainWindow):
                     "Existing output (clear to rerun)" if previous_results else (
                         status_text(states["analysis"])
                     ),
+                    status_text(states["fixrabies"]),
                 )
                 for column, value in enumerate(values):
                     self.subjects.setItem(
@@ -1422,6 +1474,7 @@ class SubjectManager(QMainWindow):
                 "Complete" if states["preprocess"] else "Not found",
                 "Complete" if states["confound"] else "Not found",
                 "Complete" if states["analysis"] else "Not found",
+                "Complete" if states["fixrabies"] else "Not found",
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1511,7 +1564,7 @@ class SubjectManager(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Remove generated scripts",
-            f"Remove {len(existing_paths)} selected script(s)? This does not remove RABIES outputs.",
+            f"Remove {len(existing_paths)} selected script(s)? This does not remove processing outputs.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -1868,6 +1921,7 @@ class SubjectManager(QMainWindow):
                         analysis_args=self.stage_args["Analysis"],
                         session=session,
                         pipeline=pipeline,
+                        fix_species=self.fix_species_selector.currentText(),
                     )
                     scripts.append((
                         script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
