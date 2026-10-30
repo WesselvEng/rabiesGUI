@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -43,6 +44,11 @@ from PySide6.QtWidgets import (
 DEFAULT_RABIES_IMAGE = ""
 DEFAULT_TEMPLATES = ""
 SPLASH_IMAGE = Path(__file__).with_name("RABIES-RABIES.png")
+PIPELINE_VARIANTS = (
+    ("Preprocessing only", "preproc_only"),
+    ("Preprocessing + confound correction", "preproc_confound"),
+    ("Whole pipeline", "whole_pipeline"),
+)
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -214,6 +220,38 @@ def subject_has_previous_results(
     session_token = f"_{session}_"
     return any(
         path.name.startswith(prefix) and session_token in path.name
+        for path in shared_cleaned.iterdir()
+    )
+
+
+def pipeline_has_previous_results(
+    subject: str, results_dir: Path, session: str, pipeline: str
+) -> bool:
+    session_results = results_dir / subject / _session_result_name(session)
+    completed_stages = {
+        "preproc_only": ("preprocess", "confound", "analysis"),
+        "preproc_confound": ("confound", "analysis"),
+        "whole_pipeline": ("analysis",),
+    }[pipeline]
+    if any(
+        (stage_results := session_results / stage).is_dir()
+        and any(stage_results.iterdir())
+        for stage in completed_stages
+    ):
+        return True
+    if pipeline != "whole_pipeline":
+        return False
+    shared_cleaned = results_dir / "cleaned_timeseries"
+    if not shared_cleaned.is_dir():
+        return False
+    prefix = f"{subject}_"
+    if session == "No session":
+        return any(
+            path.name.startswith(prefix) and "_ses-" not in path.name
+            for path in shared_cleaned.iterdir()
+        )
+    return any(
+        path.name.startswith(prefix) and f"_{session}_" in path.name
         for path in shared_cleaned.iterdir()
     )
 
@@ -690,12 +728,15 @@ def generate_subject_script(
     confound_args: str = CONFOUND_ARGS,
     analysis_args: str = ANALYSIS_ARGS,
     session: str | None = None,
+    pipeline: str = "whole_pipeline",
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
         raise ValueError(f"No *_bold.nii.gz files found for {subject}.")
     if not anat_files:
         raise ValueError(f"No *_T2w.nii.gz files found for {subject}.")
+    if pipeline not in {variant for _, variant in PIPELINE_VARIANTS}:
+        raise ValueError(f"Unknown pipeline variant: {pipeline}")
 
     file_sessions = {
         _session_name(path, subject)
@@ -784,7 +825,7 @@ def generate_subject_script(
         f"preprocess_archive={shlex.quote(str(preprocess_archive))}",
         f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis_archive={shlex.quote(str(analysis_archive))}",
-        'mkdir -p "$bids_parent" "$preprocess" "$confound" "$analysis"',
+        'mkdir -p "$bids_parent" "$preprocess"',
         'bids_staging=$(mktemp -d "$bids_parent/.${session_name}.XXXXXX")',
         'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
     ]
@@ -811,10 +852,16 @@ def generate_subject_script(
     lines.extend([
         "",
         f"result_session={shlex.quote(str(result_session))}",
-        'if [[ -d "$result_session" ]] && [[ -n "$(find "$result_session" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then',
-        '  echo "Refusing to analyze $subject session $session_name: previous results exist in $result_session. Clear this session\'s results in the GUI first." >&2',
-        "  exit 1",
-        "fi",
+    ])
+    if pipeline == "whole_pipeline":
+        lines.extend([
+            f"if [[ -d {shlex.quote(str(analysis_archive))} "
+            f"&& -n \"$(find {shlex.quote(str(analysis_archive))} -mindepth 1 -maxdepth 1 -print -quit)\" ]]; then",
+            '  echo "Refusing to analyze $subject session $session_name: previous analysis results exist. Clear this session\'s results in the GUI first." >&2',
+            "  exit 1",
+            "fi",
+        ])
+    lines.extend([
         f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
         f"  {_shell_command(preprocess_command)}",
         "fi",
@@ -828,37 +875,46 @@ def generate_subject_script(
         f"if [[ -d {shlex.quote(str(preprocess / 'preprocess_QC_report'))} && ! -d {shlex.quote(str(preprocess_archive / 'preprocess_QC_report'))} ]]; then",
         f"  cp -a {shlex.quote(str(preprocess / 'preprocess_QC_report'))} {shlex.quote(str(preprocess_archive))}/",
         "fi",
-        f"if [[ ! -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
-        f"|| ! -f {shlex.quote(str(confound_archive / confound_cli.name))} ]]; then",
-        f"  if [[ ! -f {shlex.quote(str(confound_workflow))} "
-        f"|| ! -f {shlex.quote(str(confound_cli))} ]]; then",
-        f"    {_shell_command(confound_command)}",
-        "  fi",
-        f"  mkdir -p {shlex.quote(str(confound_archive))}",
-        f"  cp -a {shlex.quote(str(confound / 'confound_correction_datasink'))} {shlex.quote(str(confound_archive))}/",
-        f"  cp -f {shlex.quote(str(confound_workflow))} {shlex.quote(str(confound_archive))}/",
-        f"  cp -f {shlex.quote(str(confound_cli))} {shlex.quote(str(confound_archive))}/",
-        f"  cp -f {shlex.quote(str(confound / 'rabies_confound_correction.log'))} {shlex.quote(str(confound_archive))}/",
-        "fi",
-        f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
-        f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
-        f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
-        f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
-        f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
-        f"  cp -f {shlex.quote(str(confound_archive / confound_workflow.name))} \"$confound/\"",
-        f"  cp -f {shlex.quote(str(confound_archive / confound_cli.name))} \"$confound/\"",
-        "fi",
-        f"if [[ ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} "
-        f"&& ! -f {shlex.quote(str(legacy_analysis_marker))} ]]; then",
-        f"  if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
-        f"    {_shell_command(analysis_command)}",
-        "  fi",
-        f"  mkdir -p {shlex.quote(str(analysis_archive))}",
-        f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
-        "  find \"$analysis\" -mindepth 1 -delete",
-        "fi",
-        "if [[ -d \"$confound\" ]]; then find \"$confound\" -mindepth 1 -delete; fi",
     ])
+    if pipeline in {"preproc_confound", "whole_pipeline"}:
+        lines.extend([
+            'mkdir -p "$confound"',
+            f"if [[ ! -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+            f"|| ! -f {shlex.quote(str(confound_archive / confound_cli.name))} ]]; then",
+            f"  if [[ ! -f {shlex.quote(str(confound_workflow))} "
+            f"|| ! -f {shlex.quote(str(confound_cli))} ]]; then",
+            f"    {_shell_command(confound_command)}",
+            "  fi",
+            f"  mkdir -p {shlex.quote(str(confound_archive))}",
+            f"  cp -a {shlex.quote(str(confound / 'confound_correction_datasink'))} {shlex.quote(str(confound_archive))}/",
+            f"  cp -f {shlex.quote(str(confound_workflow))} {shlex.quote(str(confound_archive))}/",
+            f"  cp -f {shlex.quote(str(confound_cli))} {shlex.quote(str(confound_archive))}/",
+            f"  cp -f {shlex.quote(str(confound / 'rabies_confound_correction.log'))} {shlex.quote(str(confound_archive))}/",
+            "fi",
+        ])
+    if pipeline == "whole_pipeline":
+        lines.extend([
+            'mkdir -p "$analysis"',
+            f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+            f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+            f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
+            f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
+            f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
+            f"  cp -f {shlex.quote(str(confound_archive / confound_workflow.name))} \"$confound/\"",
+            f"  cp -f {shlex.quote(str(confound_archive / confound_cli.name))} \"$confound/\"",
+            "fi",
+            f"if [[ ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} "
+            f"&& ! -f {shlex.quote(str(legacy_analysis_marker))} ]]; then",
+            f"  if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
+            f"    {_shell_command(analysis_command)}",
+            "  fi",
+            f"  mkdir -p {shlex.quote(str(analysis_archive))}",
+            f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
+            "  find \"$analysis\" -mindepth 1 -delete",
+            "fi",
+        ])
+    if pipeline in {"preproc_confound", "whole_pipeline"}:
+        lines.append('if [[ -d "$confound" ]]; then find "$confound" -mindepth 1 -delete; fi')
     lines.extend([
         'mkdir -p "$session_archive"',
         'cp -a "$bids/." "$session_archive/"',
@@ -1186,7 +1242,7 @@ class SubjectManager(QMainWindow):
         options.addStretch()
         for label, callback in (
             ("RABIES arguments…", self.edit_arguments),
-            ("Create scripts", self.create_scripts),
+            ("Create pipeline scripts", self.create_scripts),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("Submit scripts with sbatch", self.submit_scripts),
         ):
@@ -1436,6 +1492,13 @@ class SubjectManager(QMainWindow):
             )
             if path.is_file()
         ]
+        existing_paths.extend(
+            path
+            for subject in selected
+            for _, variant in PIPELINE_VARIANTS
+            for path in (script_dir / variant).glob(f"scrip_{subject}_*.sh")
+            if path.is_file()
+        )
         if not existing_paths:
             QMessageBox.information(self, "No scripts found", "No generated scripts exist for the selected subjects.")
             return
@@ -1783,37 +1846,41 @@ class SubjectManager(QMainWindow):
                 for session, (bold_files, anat_files) in discover_session_files(
                     subject_dir
                 ).items():
-                    script = generate_subject_script(
-                        subject,
-                        bold_files,
-                        anat_files,
-                        output,
-                        results,
-                        templates,
-                        image,
-                        preprocess_args=self.stage_args["Preprocessing"],
-                        confound_args=self.stage_args["Confound correction"],
-                        analysis_args=self.stage_args["Analysis"],
-                        session=session,
-                    )
                     session_name = _session_result_name(session)
-                    scripts.append((
-                        script_dir / f"scrip_{subject}_{session_name}.sh",
-                        script,
-                    ))
+                    for _, pipeline in PIPELINE_VARIANTS:
+                        script = generate_subject_script(
+                            subject,
+                            bold_files,
+                            anat_files,
+                            output,
+                            results,
+                            templates,
+                            image,
+                            preprocess_args=self.stage_args["Preprocessing"],
+                            confound_args=self.stage_args["Confound correction"],
+                            analysis_args=self.stage_args["Analysis"],
+                            session=session,
+                            pipeline=pipeline,
+                        )
+                        scripts.append((
+                            script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
+                            script,
+                        ))
             for script_path, script in scripts:
+                script_path.parent.mkdir(parents=True, exist_ok=True)
                 script_path.write_text(script, encoding="utf-8")
                 script_path.chmod(0o755)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
         self.status.setText(
-            f"Created {len(scripts)} session script(s) for "
+            f"Created {len(scripts)} session script variant(s) for "
             f"{len(selected)} subject(s) in {script_dir}."
         )
         QMessageBox.information(
             self, "Session scripts created",
-            f"Created {len(scripts)} session script(s) for {len(selected)} subject(s).",
+            f"Created {len(scripts)} session script variants for {len(selected)} subject(s), "
+            f"organized in {script_dir}.",
         )
 
     def submit_scripts(self) -> None:
@@ -1843,6 +1910,19 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
+        pipeline_label, accepted = QInputDialog.getItem(
+            self,
+            "Select pipeline",
+            "Submit scripts for:",
+            [label for label, _ in PIPELINE_VARIANTS],
+            2,
+            False,
+        )
+        if not accepted:
+            return
+        pipeline = dict((label, value) for label, value in PIPELINE_VARIANTS)[
+            pipeline_label
+        ]
         session_filter = (
             {selected[0]: set(selected_session_names)}
             if selected_session_names
@@ -1880,10 +1960,12 @@ class SubjectManager(QMainWindow):
                     continue
                 session_name = _session_result_name(session)
                 script_path = (
-                    output / "tmp_script"
+                    output / "tmp_script" / pipeline
                     / f"scrip_{subject}_{session_name}.sh"
                 )
-                if subject_has_previous_results(subject, results, session):
+                if pipeline_has_previous_results(
+                    subject, results, session, pipeline
+                ):
                     blocked_sessions.append(f"{subject}/{session}")
                 elif script_path.is_file():
                     script_paths.append(script_path)
@@ -1915,7 +1997,8 @@ class SubjectManager(QMainWindow):
         confirmation = QMessageBox.question(
             self,
             "Submit session jobs",
-            f"Submit {len(script_paths)} session job(s) to SLURM with sbatch?"
+            f"Submit {len(script_paths)} {pipeline_label.lower()} session job(s) "
+            "to SLURM with sbatch?"
             + (
                 "\nExisting results will cause these sessions to be skipped:\n"
                 + "\n".join(blocked_sessions)

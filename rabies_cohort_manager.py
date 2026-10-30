@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -41,6 +42,11 @@ from PySide6.QtWidgets import (
 
 DEFAULT_RABIES_IMAGE = ""
 DEFAULT_TEMPLATES = ""
+PIPELINE_VARIANTS = (
+    ("Preprocessing only", "preproc_only"),
+    ("Preprocessing + confound correction", "preproc_confound"),
+    ("Whole pipeline", "whole_pipeline"),
+)
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -583,6 +589,7 @@ def generate_cohort_script(
     preprocess_args: str = PREPROCESS_ARGS,
     confound_args: str = CONFOUND_ARGS,
     analysis_args: str = ANALYSIS_ARGS,
+    pipeline: str = "whole_pipeline",
 ) -> str:
     """Build one resumable RABIES job for all subjects and sessions in a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
@@ -594,6 +601,8 @@ def generate_cohort_script(
     subjects = discover_subjects(bids_dir)
     if not subjects:
         raise ValueError(f"No BIDS subjects found in {bids_dir}.")
+    if pipeline not in {variant for _, variant in PIPELINE_VARIANTS}:
+        raise ValueError(f"Unknown pipeline variant: {pipeline}")
 
     preprocess = cohort_dir / "preprocess"
     confound = cohort_dir / "confound"
@@ -645,7 +654,7 @@ def generate_cohort_script(
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
     analysis_workflow = _workflow_path(analysis, "analysis")
-    return "\n".join([
+    lines = [
         "#!/usr/bin/env bash",
         "#SBATCH --time=24:00:00",
         "#SBATCH --mem=16G",
@@ -657,25 +666,40 @@ def generate_cohort_script(
         f"analysis={shlex.quote(str(analysis))}",
         f"bids_source={shlex.quote(str(bids_dir))}",
         f"archived_bids={shlex.quote(str(archived_bids))}",
-        'mkdir -p "$cohort" "$preprocess" "$confound" "$analysis"',
+        'mkdir -p "$cohort" "$preprocess"',
         'if [[ ! -d "$archived_bids" ]]; then',
         '  bids_staging=$(mktemp -d "$cohort/.input_bids.XXXXXX")',
         '  cp -a "$bids_source/." "$bids_staging/"',
         '  mv "$bids_staging" "$archived_bids"',
         "fi",
         f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {archived_bids}')}",
+    ]
+    if pipeline in {"preproc_confound", "whole_pipeline"}:
+        lines.append('mkdir -p "$confound"')
+    if pipeline == "whole_pipeline":
+        lines.append('mkdir -p "$analysis"')
+    lines.extend([
         f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
         "  " + _shell_command(preprocess_command),
         "fi",
-        f"if [[ ! -f {shlex.quote(str(confound_workflow))} ]]; then",
-        "  " + _shell_command(confound_command),
-        "fi",
-        f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
-        "  " + _shell_command(analysis_command),
-        "fi",
-        'echo "Finished cohort analysis"',
+    ])
+    if pipeline in {"preproc_confound", "whole_pipeline"}:
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(confound_workflow))} ]]; then",
+            "  " + _shell_command(confound_command),
+            "fi",
+        ])
+    if pipeline == "whole_pipeline":
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
+            "  " + _shell_command(analysis_command),
+            "fi",
+        ])
+    lines.extend([
+        f'echo "Finished cohort {pipeline.replace("_", " ")}"',
         "",
     ])
+    return "\n".join(lines)
 
 
 def _session_name(path: Path, subject: str) -> str | None:
@@ -1161,7 +1185,7 @@ class SubjectManager(QMainWindow):
             ("Refresh subjects", self.refresh_subjects),
             ("Select all", self.select_all),
             ("Clear selection", self.clear_selection),
-            ("Remove cohort script", self.remove_scripts),
+            ("Remove cohort scripts", self.remove_scripts),
             ("Move cleaned timeseries", self.move_selected_cleaned_timeseries),
         ):
             button = QPushButton(label)
@@ -1170,7 +1194,7 @@ class SubjectManager(QMainWindow):
         options.addStretch()
         for label, callback in (
             ("RABIES arguments…", self.edit_arguments),
-            ("Create cohort script", self.create_scripts),
+            ("Create cohort scripts", self.create_scripts),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("Submit cohort with sbatch", self.submit_scripts),
         ):
@@ -1392,24 +1416,32 @@ class SubjectManager(QMainWindow):
             QMessageBox.critical(self, "Output directory not set", "Choose a project root or set an output directory.")
             return
 
-        script_path = output / "tmp_script" / "scrip_cohort.sh"
-        if not script_path.is_file():
-            QMessageBox.information(self, "No script found", "No cohort script exists.")
+        script_root = output / "tmp_script"
+        script_paths = [
+            script_root / variant / "scrip_cohort.sh"
+            for _, variant in PIPELINE_VARIANTS
+        ]
+        script_paths.append(script_root / "scrip_cohort.sh")
+        existing_paths = [path for path in script_paths if path.is_file()]
+        if not existing_paths:
+            QMessageBox.information(self, "No scripts found", "No cohort scripts exist.")
             return
         answer = QMessageBox.question(
             self,
-            "Remove cohort script",
-            "Remove the generated cohort script? This does not remove RABIES outputs.",
+            "Remove cohort scripts",
+            f"Remove all {len(existing_paths)} generated cohort script(s)? "
+            "This does not remove RABIES outputs.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            script_path.unlink()
+            for script_path in existing_paths:
+                script_path.unlink()
         except OSError as error:
             QMessageBox.critical(self, "Could not remove scripts", str(error))
             return
-        self.status.setText("Removed the generated cohort script.")
+        self.status.setText(f"Removed {len(existing_paths)} generated cohort script(s).")
 
     def clear_selected_results(self) -> None:
         selected = self._selected_subjects()
@@ -1693,31 +1725,37 @@ class SubjectManager(QMainWindow):
         if not image.is_file():
             QMessageBox.critical(self, "RABIES image not found", f"Apptainer image does not exist: {image}")
             return
-        script_dir = output / "tmp_script"
+        script_root = output / "tmp_script"
         try:
             subject_count = len(discover_subjects(bids_dir))
-            script_dir.mkdir(parents=True, exist_ok=True)
-            script = generate_cohort_script(
-                bids_dir,
-                results,
-                templates,
-                image,
-                preprocess_args=self.stage_args["Preprocessing"],
-                confound_args=self.stage_args["Confound correction"],
-                analysis_args=self.stage_args["Analysis"],
-            )
-            script_path = script_dir / "scrip_cohort.sh"
-            script_path.write_text(script, encoding="utf-8")
-            script_path.chmod(0o755)
+            script_paths = []
+            for _, pipeline in PIPELINE_VARIANTS:
+                script = generate_cohort_script(
+                    bids_dir,
+                    results,
+                    templates,
+                    image,
+                    preprocess_args=self.stage_args["Preprocessing"],
+                    confound_args=self.stage_args["Confound correction"],
+                    analysis_args=self.stage_args["Analysis"],
+                    pipeline=pipeline,
+                )
+                script_path = script_root / pipeline / "scrip_cohort.sh"
+                script_path.parent.mkdir(parents=True, exist_ok=True)
+                script_path.write_text(script, encoding="utf-8")
+                script_path.chmod(0o755)
+                script_paths.append(script_path)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
         self.status.setText(
-            f"Created one cohort script for {subject_count} subject(s) in {script_dir}."
+            f"Created {len(script_paths)} cohort script variants for "
+            f"{subject_count} subject(s) in {script_root}."
         )
         QMessageBox.information(
-            self, "Cohort script created",
-            f"Created {script_path} for {subject_count} subject(s).",
+            self, "Cohort scripts created",
+            f"Created scripts for all three pipeline variants in {script_root} "
+            f"for {subject_count} subject(s).",
         )
 
     def submit_scripts(self) -> None:
@@ -1735,6 +1773,19 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
+        pipeline_label, accepted = QInputDialog.getItem(
+            self,
+            "Select pipeline",
+            "Submit script for:",
+            [label for label, _ in PIPELINE_VARIANTS],
+            2,
+            False,
+        )
+        if not accepted:
+            return
+        pipeline = dict((label, value) for label, value in PIPELINE_VARIANTS)[
+            pipeline_label
+        ]
         orientation_source = results / "cohort" / "input_bids"
         if not orientation_source.is_dir():
             orientation_source = bids_dir
@@ -1770,7 +1821,7 @@ class SubjectManager(QMainWindow):
                 + "\n".join(orientation_issues),
             )
             return
-        script_path = output / "tmp_script" / "scrip_cohort.sh"
+        script_path = output / "tmp_script" / pipeline / "scrip_cohort.sh"
         if not script_path.is_file():
             QMessageBox.critical(
                 self,
@@ -1803,7 +1854,8 @@ class SubjectManager(QMainWindow):
         confirmation = QMessageBox.question(
             self,
             "Submit cohort job",
-            f"Submit one RABIES job for all {len(subjects)} subject(s) in "
+            f"Submit one {pipeline_label.lower()} RABIES job for all "
+            f"{len(subjects)} subject(s) in "
             f"{bids_dir} with sbatch? The job archives the full BIDS dataset "
             f"under {results / 'cohort' / 'input_bids'} before processing.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

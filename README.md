@@ -4,10 +4,11 @@ Two PySide6 GUIs are available for viewing BIDS subjects, checking NIfTI
 orientations, and creating or submitting RABIES SLURM jobs:
 
 - `rabies_subject_manager.py` creates one independent job per BIDS session for
-  selected subjects. Each job runs preprocessing, confound correction, and
-  analysis for that session only.
+  selected subjects. It creates preprocessing-only,
+  preprocessing-plus-confound, and full-pipeline variants for each session.
 - `rabies_cohort_manager.py` creates one cohort-wide job for the full selected
-  BIDS dataset, using RABIES' native subject/session handling.
+  BIDS dataset, using RABIES' native subject/session handling, with the same
+  three pipeline variants.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -39,15 +40,18 @@ The instructions below describe the cohort-wide manager,
 `rabies_cohort_manager.py`. For independent per-session jobs, launch
 `rabies_subject_manager.py` instead and create/submit scripts for the selected
 subjects. It creates a separate `scrip_<subject>_<session>.sh` for each
-session, stages only that session's BOLD/T2w files, and writes stage outputs
-under `<output>/func_<stage>/<subject>/<session>/` and archived results under
-`<results>/<subject>/<session>/`. In the per-session manager, select session
-rows and choose **Clear selected session results** before submitting a session
-again. With no session rows selected, **Submit scripts with sbatch** submits
-eligible sessions for the selected subjects and skips sessions that already
-have archived results. If session rows are selected, it submits only those
-sessions for the current subject. Each session's analysis is independent; it
-does not combine data across sessions or subjects for group ICA.
+session and pipeline variant under
+`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`, stages
+only that session's BOLD/T2w files, and writes stage outputs under
+`<output>/func_<stage>/<subject>/<session>/` and archived results under
+`<results>/<subject>/<session>/`. Choose **Submit scripts with sbatch** and
+select which pipeline variant to submit. With no session rows selected, it
+submits eligible sessions for the selected subjects and skips sessions that
+already have results for that pipeline's stages. If session rows are selected,
+it submits only those sessions for the current subject. To rerun completed
+stages, choose **Clear selected session results** first. Each session's
+analysis is independent; it does not combine data across sessions or subjects
+for group ICA.
 
 Set **Subject folder prefix** to the leading text shared by subject directory
 names. It defaults to `sub-` (for example, `sub-001`); change it to `mouse-`,
@@ -84,12 +88,15 @@ stage completes. The three stage markers under
 `<results directory>/cohort/{preprocess,confound,analysis}/` reflect progress
 for the entire BIDS dataset and are shown for every subject row.
 
-Choose **Create cohort script** to write
-`<output directory>/tmp_script/scrip_cohort.sh`, then choose **Submit cohort
-with sbatch** to submit one job for every subject and session in the selected
-BIDS folder. Selection in the subject table is only for viewing subject
-details and reorienting selected files; it does not narrow the analysis cohort.
-The script preserves the complete BIDS tree in the cohort archive, then passes
+Choose **Create cohort scripts** to write one script per pipeline variant
+under `<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`.
+Choose **Submit cohort with sbatch** and select which variant to submit as one
+job for every subject and session in the selected BIDS folder. Selection in
+the subject table is only for viewing subject details and reorienting selected
+files; it does not narrow the analysis cohort. Each script runs preprocessing
+only, preprocessing followed by confound correction, or the whole pipeline
+(including analysis). Each script preserves the complete BIDS tree in the
+cohort archive, then passes
 that archived BIDS root to RABIES, which discovers and pairs subject/session
 scans using its native BIDS handling. Its `MultiProc` workflows
 run preprocessing, confound correction, and analysis once across the dataset,
@@ -119,9 +126,9 @@ arguments in RABIES CLI form without the stage name or input/output paths.
 Braced dictionary values are supported, for example
 `--scan_QC_thresholds '{DR:{Dice:[0.3]}}'`.
 
-**Remove cohort script** deletes `scrip_cohort.sh` from `tmp_script/`; it does
-not delete processing outputs. Use **Create cohort script** to generate it
-again with the current arguments.
+**Remove cohort scripts** deletes generated scripts from the pipeline
+subfolders of `tmp_script/`; it does not delete processing outputs. Use
+**Create cohort scripts** to generate them again with the current arguments.
 
 Select subjects and choose **Move cleaned timeseries** to move their
 `*_cleaned.nii.gz` files from the cohort confound-correction datasink into the
