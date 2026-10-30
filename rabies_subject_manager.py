@@ -13,7 +13,7 @@ from pathlib import Path
 
 import nibabel as nib
 from nibabel.filebasedimages import ImageFileError
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 
 DEFAULT_RABIES_IMAGE = ""
 DEFAULT_TEMPLATES = ""
-SPLASH_IMAGE = Path(__file__).with_name("splash.png")
+SPLASH_IMAGE = Path(__file__).with_name("RABIES-RABIES.png")
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -1967,12 +1967,14 @@ if __name__ == "__main__":
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        splash = QSplashScreen(splash_pixmap)
+        splash = QSplashScreen(
+            splash_pixmap, Qt.WindowType.WindowStaysOnTopHint
+        )
         splash.show()
         app.processEvents()
 
     window = ProjectSetupWindow()
     window.show()
     if splash is not None:
-        splash.finish(window)
+        QTimer.singleShot(1000, lambda: splash.finish(window))
     app.exec()
