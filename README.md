@@ -31,6 +31,9 @@ root, output directory, results directory, RABIES image, and template folder
 (rat, mouse, or custom). Choosing a project root fills the output and results
 paths with `<project root>/rabies_output/` and
 `<project root>/rabies_results/`; edit those fields afterward if needed.
+To show a splash image while the subject manager starts, place a `splash.png`
+file beside `rabies_subject_manager.py`. The splash is optional; without that
+file, the GUI starts normally.
 
 The instructions below describe the cohort-wide manager,
 `rabies_cohort_manager.py`. For independent per-session jobs, launch

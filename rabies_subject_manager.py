@@ -14,7 +14,7 @@ from pathlib import Path
 import nibabel as nib
 from nibabel.filebasedimages import ImageFileError
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplashScreen,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
 
 DEFAULT_RABIES_IMAGE = ""
 DEFAULT_TEMPLATES = ""
+SPLASH_IMAGE = Path(__file__).with_name("splash.png")
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -1956,6 +1958,21 @@ if __name__ == "__main__":
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication([])
     configure_dark_mode(app)
+    splash_pixmap = QPixmap(str(SPLASH_IMAGE))
+    splash: QSplashScreen | None = None
+    if not splash_pixmap.isNull():
+        splash_pixmap = splash_pixmap.scaled(
+            640,
+            480,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        splash = QSplashScreen(splash_pixmap)
+        splash.show()
+        app.processEvents()
+
     window = ProjectSetupWindow()
     window.show()
+    if splash is not None:
+        splash.finish(window)
     app.exec()
