@@ -623,14 +623,16 @@ def generate_cohort_script(
         "/input_bids/", "/preprocess_outputs/",
     ] + shlex.split(_expand_template_paths(preprocess_args, templates))
     confound_command = command_base + [
+        "-B", bind(archived_bids, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(confound, "/confound_correction_outputs"),
         "-B", bind(templates_dir, "/templates", True),
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
         "confound_correction",
-        "/preprocess_outputs/", "/confound_correction_outputs/",
+        "/preprocess_outputs/", "/confound_correction_outputs/",    
     ] + shlex.split(confound_args)
     analysis_command = command_base + [
+        "-B", bind(archived_bids, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs", True),
         "-B", bind(confound, "/confound_correction_outputs"),
         "-B", bind(analysis, "/analysis_outputs"),
