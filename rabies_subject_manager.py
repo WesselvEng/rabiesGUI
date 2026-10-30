@@ -786,7 +786,8 @@ def generate_subject_script(
         "-B", bind(bids, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(templates_dir, "/templates", True),
-        str(rabies_image), "-f", "-p", "MultiProc", "preprocess",
+        str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "4",
+        "preprocess",
         "/input_bids/", "/preprocess_outputs/",
     ] + shlex.split(_expand_template_paths(preprocess_args, templates))
     confound_command = command_base + [
@@ -811,7 +812,7 @@ def generate_subject_script(
         "#!/usr/bin/env bash",
         "#SBATCH --time=12:00:00",
         "#SBATCH --mem=8G",
-        "#SBATCH --cpus-per-task=2",
+        "#SBATCH --cpus-per-task=4",
         "set -euo pipefail",
         f"subject={shlex.quote(subject)}",
         f"session_name={shlex.quote(session_name)}",
