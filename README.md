@@ -54,9 +54,16 @@ Scripts are saved under
 `<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare}/`. Each
 script stages only that session's BOLD/T2w files and writes stage outputs under
 `<output>/func_<stage>/<subject>/<session>/` and archived results under
-`<results>/<subject>/<session>/`; FIXRABIES prepare outputs are written to
-`<results>/<subject>/<session>/fixrabies/`. Choose **Submit scripts with sbatch** and
-select which pipeline variant to submit. With no session rows selected, it
+`<results>/<subject>/<session>/`. For FIXRABIES, choose **Create new shared FIX
+folder…** or an existing project-level `fixrabies_*` folder from the **FIX
+folder** selector. All selected subject/session scripts then use that same
+folder and selected species. Existing FIX folders reject a species mismatch.
+The subject table shows each subject's assigned FIX folder(s), including
+assignments for scripts that have not yet run. Prepared scan data is stored
+under `<project root>/fixrabies_*/data/`. The generated jobs serialize FIX
+preparation with a shared lock, so they can be submitted together without
+running their FIX workflows concurrently against the same directory.
+Choose **Submit scripts with sbatch** and select which pipeline variant to submit. With no session rows selected, it
 submits eligible sessions for the selected subjects and skips sessions that
 already have results for that pipeline's stages. If session rows are selected,
 it submits only those sessions for the current subject. To rerun completed
@@ -96,7 +103,10 @@ inputs and stage outputs cannot become inconsistent.
 
 RABIES stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. FIXRABIES status is based on prepared scan
-directories under `<results directory>/cohort/fixrabies/data/`. Status is
+directories in the selected project's shared FIX folder for the subject
+manager. The subject table also lists shared FIX folders assigned to each
+subject. In the cohort manager, FIXRABIES status remains based on prepared scan
+directories under `<results directory>/cohort/fixrabies/data/`; status is
 cohort-wide and is shown for every subject row.
 
 Choose the pipeline in the dropdown next to **Create script**, then create the

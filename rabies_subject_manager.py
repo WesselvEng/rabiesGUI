@@ -50,6 +50,10 @@ PIPELINE_VARIANTS = (
     ("Preprocessing + FIXRABIES prepare", "fixrabies_prepare"),
 )
 FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
+FIX_DIRECTORY_PREFIX = "fixrabies_"
+FIX_SUBJECTS_FILE = ".rabies_gui_subjects.txt"
+FIX_SPECIES_FILE = ".rabies_gui_species.txt"
+FIX_CREATE_NEW = "__create_new__"
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -225,8 +229,137 @@ def subject_has_previous_results(
     )
 
 
+def list_fix_directories(project_root: Path) -> list[Path]:
+    """Find project-level FIXRABIES directories created by this manager."""
+    if not project_root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in project_root.iterdir()
+        if path.is_dir()
+        and not path.is_symlink()
+        and path.name.startswith(FIX_DIRECTORY_PREFIX)
+        and (
+            (path / FIX_SUBJECTS_FILE).is_file()
+            or (path / "data").is_dir()
+        )
+    )
+
+
+def fix_directory_has_subject(
+    fix_dir: Path, subject: str, session: str | None = None
+) -> bool:
+    """Check assignments and prepared scan IDs for a subject in a FIX directory."""
+    assignments = fix_dir / FIX_SUBJECTS_FILE
+    if session is None and assignments.is_file():
+        if subject in {
+            line.strip()
+            for line in assignments.read_text(encoding="utf-8").splitlines()
+        }:
+            return True
+
+    data_dir = fix_dir / "data"
+    if not data_dir.is_dir():
+        return False
+    for scan_dir in data_dir.iterdir():
+        if not scan_dir.is_dir() or not (
+            scan_dir.name == subject or scan_dir.name.startswith(f"{subject}_")
+        ):
+            continue
+        if session is None:
+            return True
+        if session == "No session":
+            if "_ses-" not in scan_dir.name:
+                return True
+        elif f"_{session}_" in scan_dir.name or scan_dir.name.endswith(f"_{session}"):
+            return True
+    return False
+
+
+def fix_directories_for_subject(
+    project_root: Path, subject: str
+) -> list[Path]:
+    """Return all project FIX directories containing or assigned to a subject."""
+    return [
+        fix_dir
+        for fix_dir in list_fix_directories(project_root)
+        if fix_directory_has_subject(fix_dir, subject)
+    ]
+
+
+def fix_directory_has_prepared_scan(
+    fix_dir: Path, subject: str, session: str
+) -> bool:
+    """Check whether a FIX directory already has prepared scans for a session."""
+    data_dir = fix_dir / "data"
+    if not data_dir.is_dir():
+        return False
+    for scan_dir in data_dir.iterdir():
+        if not scan_dir.is_dir() or not (
+            scan_dir.name == subject or scan_dir.name.startswith(f"{subject}_")
+        ):
+            continue
+        if session == "No session":
+            if "_ses-" not in scan_dir.name:
+                return True
+        elif f"_{session}_" in scan_dir.name or scan_dir.name.endswith(f"_{session}"):
+            return True
+    return False
+
+
+def suggested_fix_directory(project_root: Path) -> Path:
+    """Return an unused project-level FIX directory path."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    candidate = project_root / f"{FIX_DIRECTORY_PREFIX}{timestamp}"
+    suffix = 1
+    while candidate.exists():
+        candidate = project_root / f"{FIX_DIRECTORY_PREFIX}{timestamp}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def record_fix_subjects(
+    fix_dir: Path, subjects: list[str], species: str
+) -> None:
+    """Persist pending and completed subject assignments in a FIX directory."""
+    species_file = fix_dir / FIX_SPECIES_FILE
+    if species_file.is_file():
+        existing_species = species_file.read_text(encoding="utf-8").strip()
+        if existing_species != species:
+            raise ValueError(
+                f"FIXRABIES folder {fix_dir} uses {existing_species!r}, "
+                f"not the selected species {species!r}."
+            )
+    else:
+        species_file.write_text(species + "\n", encoding="utf-8")
+    manifest = fix_dir / FIX_SUBJECTS_FILE
+    existing = (
+        manifest.read_text(encoding="utf-8").splitlines()
+        if manifest.is_file()
+        else []
+    )
+    manifest.write_text(
+        "\n".join(sorted(set(existing).union(subjects))) + "\n",
+        encoding="utf-8",
+    )
+
+
+def fix_directory_from_script(script_path: Path) -> Path | None:
+    """Read the shared FIX directory embedded in a generated script."""
+    for line in script_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("fix_dir="):
+            assignment = shlex.split(line)
+            if assignment:
+                return Path(assignment[0].partition("=")[2])
+    return None
+
+
 def pipeline_has_previous_results(
-    subject: str, results_dir: Path, session: str, pipeline: str
+    subject: str,
+    results_dir: Path,
+    session: str,
+    pipeline: str,
+    fix_dir: Path | None = None,
 ) -> bool:
     session_results = results_dir / subject / _session_result_name(session)
     completed_stages = {
@@ -241,6 +374,8 @@ def pipeline_has_previous_results(
         for stage in completed_stages
     ):
         return True
+    if pipeline == "fixrabies_prepare" and fix_dir is not None:
+        return fix_directory_has_prepared_scan(fix_dir, subject, session)
     if pipeline != "whole_pipeline":
         return False
     shared_cleaned = results_dir / "cleaned_timeseries"
@@ -407,6 +542,7 @@ def stage_status(
     output_dir: Path,
     results_dir: Path,
     session: str | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, bool]:
     """Report completed RABIES stages and FIXRABIES prepared scan output."""
     subject_output = output_dir / "func_preprocess" / subject
@@ -434,12 +570,16 @@ def stage_status(
         _workflow_path(subject_results / "analysis" / subject, "analysis"),
         subject_results / "analysis" / subject / "rabies_analysis.pkl",
     )
-    fix_data = subject_results / "fixrabies" / "data"
+    fix_session = session if session is not None else "No session"
+    fix_complete = project_root is not None and any(
+        fix_directory_has_prepared_scan(fix_dir, subject, fix_session)
+        for fix_dir in list_fix_directories(project_root)
+    )
     return {
         "preprocess": any(path.is_file() for path in preprocess_candidates),
         "confound": any(path.is_file() for path in confound_candidates),
         "analysis": any(path.is_file() for path in analysis_candidates),
-        "fixrabies": fix_data.is_dir() and any(fix_data.iterdir()),
+        "fixrabies": fix_complete,
     }
 
 
@@ -734,6 +874,7 @@ def generate_subject_script(
     session: str | None = None,
     pipeline: str = "whole_pipeline",
     fix_species: str = "ratSIGMA",
+    fix_dir: Path | None = None,
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
@@ -744,6 +885,8 @@ def generate_subject_script(
         raise ValueError(f"Unknown pipeline variant: {pipeline}")
     if fix_species not in FIXRABIES_SPECIES:
         raise ValueError(f"Unsupported FIXRABIES species: {fix_species}")
+    if pipeline == "fixrabies_prepare" and fix_dir is None:
+        raise ValueError("A shared project-level FIXRABIES directory is required.")
 
     file_sessions = {
         _session_name(path, subject)
@@ -774,8 +917,6 @@ def generate_subject_script(
     preprocess_archive = result_session / "preprocess"
     confound_archive = result_session / "confound"
     analysis_archive = result_session / "analysis"
-    fix_dir = result_session / "fixrabies"
-
     templates = {
         "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
         "brain_mask": "/templates/anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
@@ -816,13 +957,36 @@ def generate_subject_script(
         str(rabies_image), "-f", "-p", "MultiProc", "analysis",
         "/confound_correction_outputs/", "/analysis_outputs/",
     ] + shlex.split(_expand_template_paths(analysis_args, templates))
-    fix_prepare_command = [
-        "fixrabies", "prepare",
-        "-preprocess_dir", str(preprocess),
-        "-fix_dir", str(fix_dir),
-        "-species", fix_species,
-        "-nipype", '{"plugin":"MultiProc","n_procs":4}',
-    ]
+    fix_prepare_command = None
+    fix_marker = None
+    fix_scan_check = None
+    if pipeline == "fixrabies_prepare":
+        assert fix_dir is not None
+        fix_prepare_command = [
+            "fixrabies", "prepare",
+            "-preprocess_dir", str(preprocess),
+            "-fix_dir", str(fix_dir),
+            "-species", fix_species,
+            "-nipype", '{"plugin":"MultiProc","n_procs":4}',
+        ]
+        fix_marker = fix_dir / ".rabies_gui_prepared" / f"{subject}_{session_name}.done"
+        scan_prefix = (
+            subject if session_name == "no-session"
+            else f"{subject}_{session_name}"
+        )
+        find_names = (
+            f"-name {shlex.quote(scan_prefix)} "
+            f"-o -name {shlex.quote(scan_prefix + '_*')}"
+        )
+        no_session_filter = (
+            " ! -name '*_ses-*'" if session_name == "no-session" else ""
+        )
+        fix_scan_check = (
+            f'[[ -d {shlex.quote(str(fix_dir / "data"))} && '
+            f'-n "$(find {shlex.quote(str(fix_dir / "data"))} '
+            f'-mindepth 1 -maxdepth 1 -type d \\( {find_names} \\)'
+            f'{no_session_filter} -print -quit)" ]]'
+        )
 
     lines = [
         "#!/usr/bin/env bash",
@@ -837,6 +1001,11 @@ def generate_subject_script(
         f"preprocess={shlex.quote(str(preprocess))}",
         f"confound={shlex.quote(str(confound))}",
         f"analysis={shlex.quote(str(analysis))}",
+        *(
+            [f"fix_dir={shlex.quote(str(fix_dir))}"]
+            if pipeline == "fixrabies_prepare" and fix_dir is not None
+            else []
+        ),
         f"session_archive={shlex.quote(str(session_archive))}",
         f"preprocess_archive={shlex.quote(str(preprocess_archive))}",
         f"confound_archive={shlex.quote(str(confound_archive))}",
@@ -909,24 +1078,32 @@ def generate_subject_script(
             "fi",
         ])
     if pipeline == "fixrabies_prepare":
-        fix_data = fix_dir / "data"
-        fix_marker = fix_dir / ".prepare_complete"
+        assert fix_dir is not None
+        assert fix_marker is not None
+        assert fix_prepare_command is not None
+        assert fix_scan_check is not None
         lines.extend([
-            f"mkdir -p {shlex.quote(str(fix_dir))}",
-            f"if [[ -d {shlex.quote(str(fix_data))} "
-            f"&& -n \"$(find {shlex.quote(str(fix_data))} -mindepth 1 "
-            f"-maxdepth 1 -print -quit)\" "
-            f"&& ! -f {shlex.quote(str(fix_marker))} ]]; then",
-            '  echo "Existing FIXRABIES data found; clear this session\'s results before preparing again." >&2',
-            "  exit 1",
-            "fi",
-            f"if [[ ! -f {shlex.quote(str(fix_marker))} ]]; then",
-            '  if ! command -v fixrabies >/dev/null 2>&1; then',
-            '    echo "FIXRABIES CLI (fixrabies) is not available on PATH in this job environment." >&2',
+            f"mkdir -p {shlex.quote(str(fix_dir / '.rabies_gui_prepared'))}",
+            f"if [[ ! -f {shlex.quote(str(fix_marker))} ]] || ! {fix_scan_check}; then",
+            '  if ! command -v flock >/dev/null 2>&1; then',
+            '    echo "flock is required to safely prepare scans into a shared FIXRABIES directory." >&2',
             "    exit 127",
             "  fi",
-            f"  {_shell_command(fix_prepare_command)}",
-            f"  touch {shlex.quote(str(fix_marker))}",
+            "  (",
+            "    flock -x 9",
+            f"    if [[ ! -f {shlex.quote(str(fix_marker))} ]] || ! {fix_scan_check}; then",
+            '      if ! command -v fixrabies >/dev/null 2>&1; then',
+            '        echo "FIXRABIES CLI (fixrabies) is not available on PATH in this job environment." >&2',
+            "        exit 127",
+            "      fi",
+            f"      if {fix_scan_check}; then",
+            '        echo "FIXRABIES data for this subject/session already exists without a completion marker; inspect the scan output before retrying." >&2',
+            "        exit 1",
+            "      fi",
+            f"      {_shell_command(fix_prepare_command)}",
+            f"      touch {shlex.quote(str(fix_marker))}",
+            "    fi",
+            f"  ) 9>{shlex.quote(str(fix_dir / '.rabies_gui_prepare.lock'))}",
             "fi",
         ])
     if pipeline == "whole_pipeline":
@@ -1220,9 +1397,12 @@ class SubjectManager(QMainWindow):
         project_options.addWidget(project_settings)
         layout.addLayout(project_options)
 
-        self.subjects = QTableWidget(0, 7)
+        self.subjects = QTableWidget(0, 8)
         self.subjects.setHorizontalHeaderLabels(
-            ["Subject", "BOLD scans", "T2w scans", "Preprocess", "Confound", "Analysis", "FIXRABIES"]
+            [
+                "Subject", "BOLD scans", "T2w scans", "Preprocess", "Confound",
+                "Analysis", "FIXRABIES", "FIX folder(s)",
+            ]
         )
         self.subjects.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.subjects.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -1290,23 +1470,32 @@ class SubjectManager(QMainWindow):
         for label, pipeline in PIPELINE_VARIANTS:
             self.pipeline_selector.addItem(label, pipeline)
         options.addWidget(self.pipeline_selector)
-        options.addWidget(QLabel("FIX species:"))
         self.fix_species_selector = QComboBox()
         self.fix_species_selector.addItems(FIXRABIES_SPECIES)
         self.fix_species_selector.setToolTip(
             "Choose the FIXRABIES species that matches the RABIES common-space template."
         )
         self.fix_species_selector.setEnabled(False)
-        self.pipeline_selector.currentIndexChanged.connect(
-            lambda _index: self.fix_species_selector.setEnabled(
-                self.pipeline_selector.currentData() == "fixrabies_prepare"
-            )
+        self.fix_directory_selector = QComboBox()
+        self.fix_directory_selector.setEnabled(False)
+        self.fix_directory_selector.setMinimumWidth(210)
+        self.fix_directory_selector.setToolTip(
+            "Create a new shared project-level folder or add these subjects to an existing FIXRABIES folder."
         )
-        options.addWidget(self.fix_species_selector)
+        self.pipeline_selector.currentIndexChanged.connect(
+            self._update_fix_controls
+        )
         create_scripts = QPushButton("Create script")
         create_scripts.clicked.connect(self.create_scripts)
         options.addWidget(create_scripts)
         layout.addLayout(options)
+
+        fix_options = QHBoxLayout()
+        fix_options.addWidget(QLabel("FIX species:"))
+        fix_options.addWidget(self.fix_species_selector)
+        fix_options.addWidget(QLabel("FIX folder:"))
+        fix_options.addWidget(self.fix_directory_selector, 1)
+        layout.addLayout(fix_options)
 
         cleanup_options = QHBoxLayout()
         cleanup_options.addWidget(QLabel("Archived results (permanent deletion):"))
@@ -1336,6 +1525,30 @@ class SubjectManager(QMainWindow):
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
         return self.setup_window._project_paths()
+
+    def _update_fix_controls(self, _index: int = -1) -> None:
+        enabled = self.pipeline_selector.currentData() == "fixrabies_prepare"
+        self.fix_species_selector.setEnabled(enabled)
+        self.fix_directory_selector.setEnabled(enabled)
+
+    def _refresh_fix_directory_options(self, project_root: Path) -> None:
+        selected = self.fix_directory_selector.currentData()
+        self.fix_directory_selector.blockSignals(True)
+        try:
+            self.fix_directory_selector.clear()
+            self.fix_directory_selector.addItem(
+                "Create new shared FIX folder…", FIX_CREATE_NEW
+            )
+            fix_dirs = list_fix_directories(project_root)
+            for fix_dir in fix_dirs:
+                self.fix_directory_selector.addItem(fix_dir.name, str(fix_dir))
+            selected_index = self.fix_directory_selector.findData(selected)
+            self.fix_directory_selector.setCurrentIndex(
+                selected_index if selected_index >= 0 else 0
+            )
+        finally:
+            self.fix_directory_selector.blockSignals(False)
+        self._update_fix_controls()
 
     def _selected_bids_dir(self) -> Path | None:
         return self.setup_window._selected_bids_dir()
@@ -1370,7 +1583,8 @@ class SubjectManager(QMainWindow):
             self.status.setText("Choose a project root or enter output and results directories.")
             return
         try:
-            _, output, results, _, _ = self._project_paths()
+            project_root, output, results, _, _ = self._project_paths()
+            self._refresh_fix_directory_options(project_root)
             subject_prefix = _validate_subject_prefix(
                 self.path_fields["subject_prefix"].text().strip()
             )
@@ -1385,7 +1599,7 @@ class SubjectManager(QMainWindow):
             for row, (subject, bold_count, anat_count) in enumerate(discovered):
                 session_files = discover_session_files(bids_dir / subject)
                 session_states = [
-                    stage_status(subject, output, results, session)
+                    stage_status(subject, output, results, session, project_root)
                     for session in session_files
                 ]
                 states = {
@@ -1395,6 +1609,9 @@ class SubjectManager(QMainWindow):
                 previous_results = any(
                     subject_has_previous_results(subject, results, session)
                     for session in session_files
+                )
+                assigned_fix_dirs = fix_directories_for_subject(
+                    project_root, subject
                 )
 
                 def status_text(values: list[bool]) -> str:
@@ -1414,13 +1631,20 @@ class SubjectManager(QMainWindow):
                         status_text(states["analysis"])
                     ),
                     status_text(states["fixrabies"]),
+                    ", ".join(fix_dir.name for fix_dir in assigned_fix_dirs) or "—",
                 )
                 for column, value in enumerate(values):
-                    self.subjects.setItem(
-                        row,
-                        column,
-                        QTableWidgetItem(value),
-                    )
+                    item = QTableWidgetItem(value)
+                    if column == 7 and value != "—":
+                        item.setToolTip("\n".join(
+                            str(fix_dir) for fix_dir in assigned_fix_dirs
+                        ))
+                    self.subjects.setItem(row, column, item)
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Could not read FIXRABIES assignments", str(error)
+            )
+            return
         finally:
             self.subjects.blockSignals(was_blocked)
         self.session_details.setRowCount(0)
@@ -1439,7 +1663,7 @@ class SubjectManager(QMainWindow):
             return
 
         subject = subject_item.text()
-        _, output, results, _, _ = self._project_paths()
+        project_root, output, results, _, _ = self._project_paths()
         try:
             sessions = session_nifti_orientations(bids_dir / subject)
         except OSError as error:
@@ -1447,10 +1671,18 @@ class SubjectManager(QMainWindow):
             return
         if not sessions:
             sessions = {"No session": []}
-        session_states = {
-            session: stage_status(subject, output, results, session)
-            for session in sessions
-        }
+        try:
+            session_states = {
+                session: stage_status(
+                    subject, output, results, session, project_root
+                )
+                for session in sessions
+            }
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Could not read FIXRABIES scan data", str(error)
+            )
+            return
         rows = [
             (session, path, orientation)
             for session, files in sessions.items()
@@ -1879,7 +2111,7 @@ class SubjectManager(QMainWindow):
                 "Select the original BIDS folder (og_folder) containing the sub-* folders.",
             )
             return
-        _, output, results, templates, image = self._project_paths()
+        project_root, output, results, templates, image = self._project_paths()
         if not bids_dir.is_dir():
             QMessageBox.critical(
                 self, "Original BIDS folder not found",
@@ -1898,6 +2130,36 @@ class SubjectManager(QMainWindow):
         if not image.is_file():
             QMessageBox.critical(self, "RABIES image not found", f"Apptainer image does not exist: {image}")
             return
+        fix_dir = None
+        create_fix_dir = False
+        if pipeline == "fixrabies_prepare":
+            if not project_root.is_dir():
+                QMessageBox.critical(
+                    self,
+                    "Project folder not found",
+                    f"Create or select an existing project folder before choosing a shared FIXRABIES directory: {project_root}",
+                )
+                return
+            selected_fix_dir = self.fix_directory_selector.currentData()
+            if selected_fix_dir == FIX_CREATE_NEW:
+                fix_dir = suggested_fix_directory(project_root)
+                create_fix_dir = True
+            elif selected_fix_dir:
+                fix_dir = Path(selected_fix_dir)
+                if fix_dir not in list_fix_directories(project_root):
+                    QMessageBox.critical(
+                        self,
+                        "FIXRABIES folder not found",
+                        "The selected FIXRABIES folder no longer exists. Refresh subjects and select it again.",
+                    )
+                    return
+            else:
+                QMessageBox.critical(
+                    self,
+                    "FIXRABIES folder not selected",
+                    "Choose a shared FIXRABIES folder.",
+                )
+                return
         script_dir = output / "tmp_script"
         try:
             script_dir.mkdir(parents=True, exist_ok=True)
@@ -1922,26 +2184,60 @@ class SubjectManager(QMainWindow):
                         session=session,
                         pipeline=pipeline,
                         fix_species=self.fix_species_selector.currentText(),
+                        fix_dir=fix_dir,
                     )
                     scripts.append((
                         script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
                         script,
                     ))
+            if pipeline == "fixrabies_prepare":
+                assert fix_dir is not None
+                if create_fix_dir:
+                    fix_dir.mkdir()
+                record_fix_subjects(
+                    fix_dir, selected, self.fix_species_selector.currentText()
+                )
             for script_path, script in scripts:
                 script_path.parent.mkdir(parents=True, exist_ok=True)
                 script_path.write_text(script, encoding="utf-8")
                 script_path.chmod(0o755)
+            if pipeline == "fixrabies_prepare":
+                for row in range(self.subjects.rowCount()):
+                    subject_item = self.subjects.item(row, 0)
+                    if subject_item is None or subject_item.text() not in selected:
+                        continue
+                    assigned_dirs = fix_directories_for_subject(
+                        project_root, subject_item.text()
+                    )
+                    folder_item = QTableWidgetItem(
+                        ", ".join(path.name for path in assigned_dirs) or "—"
+                    )
+                    if assigned_dirs:
+                        folder_item.setToolTip(
+                            "\n".join(str(path) for path in assigned_dirs)
+                        )
+                    self.subjects.setItem(row, 7, folder_item)
+                self._refresh_fix_directory_options(project_root)
+                selected_fix_index = self.fix_directory_selector.findData(
+                    str(fix_dir)
+                )
+                if selected_fix_index >= 0:
+                    self.fix_directory_selector.setCurrentIndex(
+                        selected_fix_index
+                    )
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
         self.status.setText(
             f"Created {pipeline_label} scripts for {len(selected)} subject(s) "
-            f"in {script_dir / pipeline}."
+            f"in {script_dir / pipeline}"
+            + (f" using {fix_dir}." if fix_dir is not None else ".")
         )
         QMessageBox.information(
             self, "Session scripts created",
             f"Created {len(scripts)} {pipeline_label.lower()} session script(s) "
-            f"in {script_dir / pipeline}.",
+            f"in {script_dir / pipeline}."
+            + (f"\nShared FIXRABIES folder: {fix_dir}" if fix_dir is not None else ""),
         )
 
     def submit_scripts(self) -> None:
@@ -2013,22 +2309,50 @@ class SubjectManager(QMainWindow):
                     output / "tmp_script" / pipeline
                     / f"scrip_{subject}_{session_name}.sh"
                 )
+                if not script_path.is_file():
+                    missing.append(str(script_path))
+                    continue
+                try:
+                    fix_dir = (
+                        fix_directory_from_script(script_path)
+                        if pipeline == "fixrabies_prepare"
+                        else None
+                    )
+                except (OSError, ValueError) as error:
+                    missing.append(f"{script_path}: {error}")
+                    continue
+                if pipeline == "fixrabies_prepare" and fix_dir is None:
+                    missing.append(
+                        f"{script_path}: no shared FIXRABIES directory is configured"
+                    )
+                    continue
                 if pipeline_has_previous_results(
-                    subject, results, session, pipeline
+                    subject, results, session, pipeline, fix_dir
                 ):
                     blocked_sessions.append(f"{subject}/{session}")
-                elif script_path.is_file():
-                    script_paths.append(script_path)
                 else:
-                    missing.append(str(script_path))
+                    script_paths.append(script_path)
         if not script_paths and blocked_sessions:
+            if pipeline == "fixrabies_prepare":
+                explanation = (
+                    "No session jobs can be submitted because prepared scan data "
+                    "already exists in the shared FIXRABIES folder for:\n"
+                    + "\n".join(blocked_sessions)
+                    + "\nChoose a different FIX folder if you intend to prepare a separate copy."
+                )
+            else:
+                explanation = (
+                    "No session jobs can be submitted because archived results already "
+                    "exist for the selected sessions:\n"
+                    + "\n".join(blocked_sessions)
+                    + "\nSelect those sessions and choose Clear selected session results to rerun them."
+                )
             QMessageBox.critical(
                 self,
-                "Session results must be cleared",
-                "No session jobs can be submitted because archived results already "
-                "exist for the selected sessions:\n"
-                + "\n".join(blocked_sessions)
-                + "\nSelect those sessions and choose Clear selected session results to rerun them.",
+                "FIXRABIES scans already prepared"
+                if pipeline == "fixrabies_prepare"
+                else "Session results must be cleared",
+                explanation,
             )
             return
         if not script_paths and not blocked_sessions and not missing:
