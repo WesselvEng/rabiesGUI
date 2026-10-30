@@ -1967,14 +1967,22 @@ if __name__ == "__main__":
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        splash = QSplashScreen(
+        splash_screen = QSplashScreen(
             splash_pixmap, Qt.WindowType.WindowStaysOnTopHint
         )
-        splash.show()
+        splash_screen.show()
+        splash = splash_screen
         app.processEvents()
 
     window = ProjectSetupWindow()
-    window.show()
     if splash is not None:
-        QTimer.singleShot(1000, lambda: splash.finish(window))
+        splash_screen = splash
+
+        def show_main_window() -> None:
+            window.show()
+            splash_screen.finish(window)
+
+        QTimer.singleShot(3000, show_main_window)
+    else:
+        window.show()
     app.exec()
