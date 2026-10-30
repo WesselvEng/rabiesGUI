@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -1242,13 +1241,19 @@ class SubjectManager(QMainWindow):
         options.addStretch()
         for label, callback in (
             ("RABIES arguments…", self.edit_arguments),
-            ("Create pipeline scripts", self.create_scripts),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("Submit scripts with sbatch", self.submit_scripts),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
             options.addWidget(button)
+        self.pipeline_selector = QComboBox()
+        for label, pipeline in PIPELINE_VARIANTS:
+            self.pipeline_selector.addItem(label, pipeline)
+        options.addWidget(self.pipeline_selector)
+        create_scripts = QPushButton("Create script")
+        create_scripts.clicked.connect(self.create_scripts)
+        options.addWidget(create_scripts)
         layout.addLayout(options)
 
         cleanup_options = QHBoxLayout()
@@ -1807,6 +1812,8 @@ class SubjectManager(QMainWindow):
         )
 
     def create_scripts(self) -> None:
+        pipeline = self.pipeline_selector.currentData()
+        pipeline_label = self.pipeline_selector.currentText()
         selected = self._selected_subjects()
         if not selected:
             QMessageBox.information(self, "No subjects selected", "Select at least one subject first.")
@@ -1847,25 +1854,24 @@ class SubjectManager(QMainWindow):
                     subject_dir
                 ).items():
                     session_name = _session_result_name(session)
-                    for _, pipeline in PIPELINE_VARIANTS:
-                        script = generate_subject_script(
-                            subject,
-                            bold_files,
-                            anat_files,
-                            output,
-                            results,
-                            templates,
-                            image,
-                            preprocess_args=self.stage_args["Preprocessing"],
-                            confound_args=self.stage_args["Confound correction"],
-                            analysis_args=self.stage_args["Analysis"],
-                            session=session,
-                            pipeline=pipeline,
-                        )
-                        scripts.append((
-                            script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
-                            script,
-                        ))
+                    script = generate_subject_script(
+                        subject,
+                        bold_files,
+                        anat_files,
+                        output,
+                        results,
+                        templates,
+                        image,
+                        preprocess_args=self.stage_args["Preprocessing"],
+                        confound_args=self.stage_args["Confound correction"],
+                        analysis_args=self.stage_args["Analysis"],
+                        session=session,
+                        pipeline=pipeline,
+                    )
+                    scripts.append((
+                        script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
+                        script,
+                    ))
             for script_path, script in scripts:
                 script_path.parent.mkdir(parents=True, exist_ok=True)
                 script_path.write_text(script, encoding="utf-8")
@@ -1874,13 +1880,13 @@ class SubjectManager(QMainWindow):
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
         self.status.setText(
-            f"Created {len(scripts)} session script variant(s) for "
-            f"{len(selected)} subject(s) in {script_dir}."
+            f"Created {pipeline_label} scripts for {len(selected)} subject(s) "
+            f"in {script_dir / pipeline}."
         )
         QMessageBox.information(
             self, "Session scripts created",
-            f"Created {len(scripts)} session script variants for {len(selected)} subject(s), "
-            f"organized in {script_dir}.",
+            f"Created {len(scripts)} {pipeline_label.lower()} session script(s) "
+            f"in {script_dir / pipeline}.",
         )
 
     def submit_scripts(self) -> None:
@@ -1910,19 +1916,8 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
-        pipeline_label, accepted = QInputDialog.getItem(
-            self,
-            "Select pipeline",
-            "Submit scripts for:",
-            [label for label, _ in PIPELINE_VARIANTS],
-            2,
-            False,
-        )
-        if not accepted:
-            return
-        pipeline = dict((label, value) for label, value in PIPELINE_VARIANTS)[
-            pipeline_label
-        ]
+        pipeline = self.pipeline_selector.currentData()
+        pipeline_label = self.pipeline_selector.currentText()
         session_filter = (
             {selected[0]: set(selected_session_names)}
             if selected_session_names

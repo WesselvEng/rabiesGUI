@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -1194,13 +1193,19 @@ class SubjectManager(QMainWindow):
         options.addStretch()
         for label, callback in (
             ("RABIES arguments…", self.edit_arguments),
-            ("Create cohort scripts", self.create_scripts),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("Submit cohort with sbatch", self.submit_scripts),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
             options.addWidget(button)
+        self.pipeline_selector = QComboBox()
+        for label, pipeline in PIPELINE_VARIANTS:
+            self.pipeline_selector.addItem(label, pipeline)
+        options.addWidget(self.pipeline_selector)
+        create_scripts = QPushButton("Create script")
+        create_scripts.clicked.connect(self.create_scripts)
+        options.addWidget(create_scripts)
         layout.addLayout(options)
 
         cleanup_options = QHBoxLayout()
@@ -1705,6 +1710,8 @@ class SubjectManager(QMainWindow):
         )
 
     def create_scripts(self) -> None:
+        pipeline = self.pipeline_selector.currentData()
+        pipeline_label = self.pipeline_selector.currentText()
         bids_dir = self._selected_bids_dir()
         if bids_dir is None or not bids_dir.is_dir():
             QMessageBox.critical(
@@ -1728,34 +1735,31 @@ class SubjectManager(QMainWindow):
         script_root = output / "tmp_script"
         try:
             subject_count = len(discover_subjects(bids_dir))
-            script_paths = []
-            for _, pipeline in PIPELINE_VARIANTS:
-                script = generate_cohort_script(
-                    bids_dir,
-                    results,
-                    templates,
-                    image,
-                    preprocess_args=self.stage_args["Preprocessing"],
-                    confound_args=self.stage_args["Confound correction"],
-                    analysis_args=self.stage_args["Analysis"],
-                    pipeline=pipeline,
-                )
-                script_path = script_root / pipeline / "scrip_cohort.sh"
-                script_path.parent.mkdir(parents=True, exist_ok=True)
-                script_path.write_text(script, encoding="utf-8")
-                script_path.chmod(0o755)
-                script_paths.append(script_path)
+            script = generate_cohort_script(
+                bids_dir,
+                results,
+                templates,
+                image,
+                preprocess_args=self.stage_args["Preprocessing"],
+                confound_args=self.stage_args["Confound correction"],
+                analysis_args=self.stage_args["Analysis"],
+                pipeline=pipeline,
+            )
+            script_path = script_root / pipeline / "scrip_cohort.sh"
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text(script, encoding="utf-8")
+            script_path.chmod(0o755)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
             return
         self.status.setText(
-            f"Created {len(script_paths)} cohort script variants for "
-            f"{subject_count} subject(s) in {script_root}."
+            f"Created {pipeline_label} cohort script for "
+            f"{subject_count} subject(s) in {script_path.parent}."
         )
         QMessageBox.information(
-            self, "Cohort scripts created",
-            f"Created scripts for all three pipeline variants in {script_root} "
-            f"for {subject_count} subject(s).",
+            self, "Cohort script created",
+            f"Created {pipeline_label.lower()} script for {subject_count} "
+            f"subject(s): {script_path}",
         )
 
     def submit_scripts(self) -> None:
@@ -1773,19 +1777,8 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
-        pipeline_label, accepted = QInputDialog.getItem(
-            self,
-            "Select pipeline",
-            "Submit script for:",
-            [label for label, _ in PIPELINE_VARIANTS],
-            2,
-            False,
-        )
-        if not accepted:
-            return
-        pipeline = dict((label, value) for label, value in PIPELINE_VARIANTS)[
-            pipeline_label
-        ]
+        pipeline = self.pipeline_selector.currentData()
+        pipeline_label = self.pipeline_selector.currentText()
         orientation_source = results / "cohort" / "input_bids"
         if not orientation_source.is_dir():
             orientation_source = bids_dir

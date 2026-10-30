@@ -40,9 +40,10 @@ The instructions below describe the cohort-wide manager,
 `rabies_cohort_manager.py`. For independent per-session jobs, launch
 `rabies_subject_manager.py` instead and create/submit scripts for the selected
 subjects. It creates a separate `scrip_<subject>_<session>.sh` for each
-session and pipeline variant under
-`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`, stages
-only that session's BOLD/T2w files, and writes stage outputs under
+session for the pipeline selected in the dropdown next to **Create script**.
+Scripts are saved under
+`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`. Each
+script stages only that session's BOLD/T2w files and writes stage outputs under
 `<output>/func_<stage>/<subject>/<session>/` and archived results under
 `<results>/<subject>/<session>/`. Choose **Submit scripts with sbatch** and
 select which pipeline variant to submit. With no session rows selected, it
@@ -88,11 +89,12 @@ stage completes. The three stage markers under
 `<results directory>/cohort/{preprocess,confound,analysis}/` reflect progress
 for the entire BIDS dataset and are shown for every subject row.
 
-Choose **Create cohort scripts** to write one script per pipeline variant
-under `<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`.
-Choose **Submit cohort with sbatch** and select which variant to submit as one
-job for every subject and session in the selected BIDS folder. Selection in
-the subject table is only for viewing subject details and reorienting selected
+Choose the pipeline in the dropdown next to **Create script**, then create the
+cohort script under
+`<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline}/`.
+Choose **Submit cohort with sbatch** to submit the currently selected variant
+as one job for every subject and session in the selected BIDS folder.
+Selection in the subject table is only for viewing subject details and reorienting selected
 files; it does not narrow the analysis cohort. Each script runs preprocessing
 only, preprocessing followed by confound correction, or the whole pipeline
 (including analysis). Each script preserves the complete BIDS tree in the
@@ -127,8 +129,8 @@ Braced dictionary values are supported, for example
 `--scan_QC_thresholds '{DR:{Dice:[0.3]}}'`.
 
 **Remove cohort scripts** deletes generated scripts from the pipeline
-subfolders of `tmp_script/`; it does not delete processing outputs. Use
-**Create cohort scripts** to generate them again with the current arguments.
+subfolders of `tmp_script/`; it does not delete processing outputs. Select a
+variant and use **Create script** to generate it again with the current arguments.
 
 Select subjects and choose **Move cleaned timeseries** to move their
 `*_cleaned.nii.gz` files from the cohort confound-correction datasink into the
