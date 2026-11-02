@@ -614,6 +614,14 @@ def _validate_subject_prefix(subject_prefix: str) -> str:
     return subject_prefix
 
 
+def _is_mrs_path(path: Path, subject_dir: Path) -> bool:
+    """Return whether a path is inside a BIDS MRS modality folder."""
+    return any(
+        part.casefold() == "mrs"
+        for part in path.relative_to(subject_dir).parts[:-1]
+    )
+
+
 def _contains_subjects(directory: Path, subject_prefix: str) -> bool:
     subject_prefix = _validate_subject_prefix(subject_prefix)
     return any(
@@ -634,8 +642,16 @@ def discover_subjects(
     for subject_dir in sorted(bids_dir.iterdir()):
         if not subject_dir.is_dir() or not subject_dir.name.startswith(subject_prefix):
             continue
-        bold_count = sum(1 for _ in subject_dir.rglob("*_bold.nii.gz"))
-        anat_count = sum(1 for _ in subject_dir.rglob("*_T2w.nii.gz"))
+        bold_count = sum(
+            1
+            for path in subject_dir.rglob("*_bold.nii.gz")
+            if not _is_mrs_path(path, subject_dir)
+        )
+        anat_count = sum(
+            1
+            for path in subject_dir.rglob("*_T2w.nii.gz")
+            if not _is_mrs_path(path, subject_dir)
+        )
         subjects.append((subject_dir.name, bold_count, anat_count))
     return subjects
 
@@ -659,7 +675,9 @@ def session_nifti_orientations(
         if entry.is_dir() and entry.name.startswith("ses-")
     }
     for path in sorted(subject_dir.rglob("*")):
-        if not path.is_file() or not (
+        if not path.is_file() or _is_mrs_path(path, subject_dir):
+            continue
+        if not (
             path.name.endswith(".nii") or path.name.endswith(".nii.gz")
         ):
             continue
@@ -877,6 +895,8 @@ def discover_session_files(
     sessions: dict[str, tuple[list[Path], list[Path]]] = {}
     for modality, suffix in (("func", "*_bold.nii.gz"), ("anat", "*_T2w.nii.gz")):
         for path in sorted(subject_dir.rglob(suffix)):
+            if _is_mrs_path(path, subject_dir):
+                continue
             session = _session_name(path, subject_dir.name) or "No session"
             bold_files, anat_files = sessions.setdefault(session, ([], []))
             (bold_files if modality == "func" else anat_files).append(path)
@@ -1194,7 +1214,7 @@ class ProjectSetupWindow(QMainWindow):
         paths = QWidget()
         path_layout = QFormLayout(paths)
         defaults = (
-            ("Project root", "root", ""),
+            ("Project root", "root", str(Path.cwd())),
             ("Output directory", "output", ""),
             ("Results directory", "results", ""),
             ("Template folder (rat, mouse, or custom)", "templates", DEFAULT_TEMPLATES),
@@ -1242,6 +1262,8 @@ class ProjectSetupWindow(QMainWindow):
         layout.addWidget(self.status)
         self.path_fields["root"].textChanged.connect(self._populate_bids_folders)
         self.path_fields["root"].editingFinished.connect(self._update_project_output_defaults)
+        self._update_project_output_defaults()
+        self._populate_bids_folders()
 
     def _browse(self, key: str) -> None:
         if key == "image":
@@ -1323,10 +1345,18 @@ class ProjectSetupWindow(QMainWindow):
                 f"No direct subfolders containing {subject_prefix}* subjects were found in {root_value}."
             )
             return
+        preferred_folder = Path(root_value).expanduser() / "bids"
         for folder in folders:
             self.bids_folders.addItem(folder.name, str(folder))
-            if str(folder) == previously_selected:
-                self.bids_folders.setCurrentIndex(self.bids_folders.count() - 1)
+        selected_index = (
+            self.bids_folders.findData(previously_selected)
+            if previously_selected
+            else -1
+        )
+        if selected_index < 0:
+            selected_index = self.bids_folders.findData(str(preferred_folder))
+        if selected_index >= 0:
+            self.bids_folders.setCurrentIndex(selected_index)
         if (
             previously_selected
             and Path(previously_selected).is_dir()

@@ -42,6 +42,10 @@ root, output directory, results directory, RABIES image, and template folder
 (rat, mouse, or custom). Choosing a project root fills the output and results
 paths with `<project root>/rabies_output/` and
 `<project root>/rabies_results/`; edit those fields afterward if needed.
+When launched from a terminal, the current working directory is used as the
+initial project root. If it contains a `bids/` folder with subject directories
+matching the selected subject prefix, that folder is selected as the original
+BIDS folder automatically.
 The subject manager displays `RABIES-RABIES.png` as a splash image while it
 starts. Keep the image beside `rabies_subject_manager.py`; if it is missing or
 cannot be loaded, the GUI starts normally without a splash.
@@ -100,7 +104,9 @@ counts and the status of preprocessing, confound correction, analysis, and
 FIXRABIES preparation.
 Select a subject to view its sessions, every NIfTI's orientation, whether the
 session input archive is present, and the applicable session or cohort stage
-results. Script
+results. NIfTI files under a session's `mrs/` directory are ignored by subject
+scan counts, orientation checks/reorientation, and RABIES session scripts;
+MRS data is not processed by RABIES. Script
 creation is allowed regardless of orientation, but job submission is blocked
 if any BIDS NIfTI is unreadable or is not in RAS orientation. Orientation
 entries show a concise session/modality label; hover over an entry to see its
