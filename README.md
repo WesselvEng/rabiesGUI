@@ -6,7 +6,8 @@ orientations, and creating or submitting RABIES/FIXRABIES SLURM jobs:
 - `rabies_subject_manager.py` creates one independent job per BIDS session for
   selected subjects. It creates preprocessing-only,
   preprocessing-plus-confound, full-pipeline, and preprocessing-plus-FIXRABIES
-  prepare variants for each session.
+  prepare variants for each session, plus a FIXRABIES-prepare-only variant for
+  subjects whose preprocessing outputs already exist.
 - `rabies_cohort_manager.py` creates one cohort-wide job for the full selected
   BIDS dataset, using RABIES' native subject/session handling, with the same
   four pipeline variants.
@@ -51,19 +52,28 @@ The instructions below describe the cohort-wide manager,
 subjects. It creates a separate `scrip_<subject>_<session>.sh` for each
 session for the pipeline selected in the dropdown next to **Create script**.
 Scripts are saved under
-`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare}/`. Each
-script stages only that session's BOLD/T2w files and writes stage outputs under
-`<output>/func_<stage>/<subject>/<session>/` and archived results under
-`<results>/<subject>/<session>/`. For FIXRABIES, choose **Create new shared FIX
-folder…** or an existing project-level `fixrabies_*` folder from the **FIX
-folder** selector. All selected subject/session scripts then use that same
+`<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare,fixrabies_prepare_only}/`.
+Standard pipeline scripts stage only that session's BOLD/T2w files and write
+stage outputs under `<output>/func_<stage>/<subject>/<session>/` and archived
+results under
+`<results>/<subject>/<session>/`. The FIXRABIES-prepare-only variant skips BIDS
+staging and uses the existing preprocessing outputs. For FIXRABIES, choose
+**Create new shared FIX
+folder…** or an existing FIX folder from the **FIX folder** selector. When
+creating a folder, enter a custom folder name in **New folder name** (or leave
+it blank for an automatically generated name); new folders are created directly
+under the project root. All selected subject/session scripts then use that same
 folder and selected species. Existing FIX folders reject a species mismatch.
 The subject table shows each subject's assigned FIX folder(s), including
 assignments for scripts that have not yet run. Prepared scan data is stored
-under `<project root>/fixrabies_*/data/`. The generated jobs serialize FIX
+under `<project root>/<FIX folder>/data/`. The generated jobs serialize FIX
 preparation with a shared lock, so they can be submitted together without
 running their FIX workflows concurrently against the same directory.
-Choose **Submit scripts with sbatch** and select which pipeline variant to submit. With no session rows selected, it
+Choose **FIXRABIES prepare only** to create jobs that run only `fixrabies
+prepare` against existing per-session preprocessing outputs. The GUI checks
+that each selected subject/session has a preprocessing workflow before creating
+these scripts. Choose **Submit scripts with sbatch** and select which pipeline
+variant to submit. With no session rows selected, it
 submits eligible sessions for the selected subjects and skips sessions that
 already have results for that pipeline's stages. If session rows are selected,
 it submits only those sessions for the current subject. To rerun completed

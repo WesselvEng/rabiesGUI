@@ -48,6 +48,7 @@ PIPELINE_VARIANTS = (
     ("Preprocessing + confound correction", "preproc_confound"),
     ("Whole pipeline", "whole_pipeline"),
     ("Preprocessing + FIXRABIES prepare", "fixrabies_prepare"),
+    ("FIXRABIES prepare only", "fixrabies_prepare_only"),
 )
 FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
 FIX_DIRECTORY_PREFIX = "fixrabies_"
@@ -238,10 +239,13 @@ def list_fix_directories(project_root: Path) -> list[Path]:
         for path in project_root.iterdir()
         if path.is_dir()
         and not path.is_symlink()
-        and path.name.startswith(FIX_DIRECTORY_PREFIX)
         and (
             (path / FIX_SUBJECTS_FILE).is_file()
-            or (path / "data").is_dir()
+            or (path / FIX_SPECIES_FILE).is_file()
+            or (
+                path.name.startswith(FIX_DIRECTORY_PREFIX)
+                and (path / "data").is_dir()
+            )
         )
     )
 
@@ -318,6 +322,24 @@ def suggested_fix_directory(project_root: Path) -> Path:
     return candidate
 
 
+def _validate_fix_directory_name(name: str) -> str:
+    """Validate a manually entered FIX folder name as one path component."""
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or Path(name).name != name
+        or any(character in name for character in '<>:"|?*')
+        or name.endswith((" ", "."))
+    ):
+        raise ValueError(
+            "FIX folder name must be a valid single folder name, without path "
+            "separators or reserved characters."
+        )
+    return name
+
+
 def record_fix_subjects(
     fix_dir: Path, subjects: list[str], species: str
 ) -> None:
@@ -367,6 +389,7 @@ def pipeline_has_previous_results(
         "preproc_confound": ("confound", "analysis"),
         "whole_pipeline": ("analysis",),
         "fixrabies_prepare": ("fixrabies",),
+        "fixrabies_prepare_only": ("fixrabies",),
     }[pipeline]
     if any(
         (stage_results := session_results / stage).is_dir()
@@ -374,7 +397,7 @@ def pipeline_has_previous_results(
         for stage in completed_stages
     ):
         return True
-    if pipeline == "fixrabies_prepare" and fix_dir is not None:
+    if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"} and fix_dir is not None:
         return fix_directory_has_prepared_scan(fix_dir, subject, session)
     if pipeline != "whole_pipeline":
         return False
@@ -885,7 +908,7 @@ def generate_subject_script(
         raise ValueError(f"Unknown pipeline variant: {pipeline}")
     if fix_species not in FIXRABIES_SPECIES:
         raise ValueError(f"Unsupported FIXRABIES species: {fix_species}")
-    if pipeline == "fixrabies_prepare" and fix_dir is None:
+    if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"} and fix_dir is None:
         raise ValueError("A shared project-level FIXRABIES directory is required.")
 
     file_sessions = {
@@ -960,7 +983,7 @@ def generate_subject_script(
     fix_prepare_command = None
     fix_marker = None
     fix_scan_check = None
-    if pipeline == "fixrabies_prepare":
+    if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         assert fix_dir is not None
         fix_prepare_command = [
             "fixrabies", "prepare",
@@ -1003,32 +1026,36 @@ def generate_subject_script(
         f"analysis={shlex.quote(str(analysis))}",
         *(
             [f"fix_dir={shlex.quote(str(fix_dir))}"]
-            if pipeline == "fixrabies_prepare" and fix_dir is not None
+            if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}
+            and fix_dir is not None
             else []
         ),
         f"session_archive={shlex.quote(str(session_archive))}",
         f"preprocess_archive={shlex.quote(str(preprocess_archive))}",
         f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis_archive={shlex.quote(str(analysis_archive))}",
-        'mkdir -p "$bids_parent" "$preprocess"',
-        'bids_staging=$(mktemp -d "$bids_parent/.${session_name}.XXXXXX")',
-        'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
     ]
-    for paths, modality in ((bold_files, "func"), (anat_files, "anat")):
-        for path in paths:
-            lines.append(f'mkdir -p "$bids_staging/{modality}"')
-            lines.append(
-                f"cp -f {shlex.quote(str(path))} \"$bids_staging/{modality}/\""
-            )
-    lines.extend([
-        'if [[ -L "$bids" ]]; then',
-        '  echo "Refusing to replace symlinked session input directory: $bids" >&2',
-        "  exit 1",
-        "fi",
-        'if [[ -e "$bids" ]]; then rm -rf -- "$bids"; fi',
-        'mv "$bids_staging" "$bids"',
-        'bids_staging=""',
-    ])
+    if pipeline != "fixrabies_prepare_only":
+        lines.extend([
+            'mkdir -p "$bids_parent" "$preprocess"',
+            'bids_staging=$(mktemp -d "$bids_parent/.${session_name}.XXXXXX")',
+            'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
+        ])
+        for paths, modality in ((bold_files, "func"), (anat_files, "anat")):
+            for path in paths:
+                lines.append(f'mkdir -p "$bids_staging/{modality}"')
+                lines.append(
+                    f"cp -f {shlex.quote(str(path))} \"$bids_staging/{modality}/\""
+                )
+        lines.extend([
+            'if [[ -L "$bids" ]]; then',
+            '  echo "Refusing to replace symlinked session input directory: $bids" >&2',
+            "  exit 1",
+            "fi",
+            'if [[ -e "$bids" ]]; then rm -rf -- "$bids"; fi',
+            'mv "$bids_staging" "$bids"',
+            'bids_staging=""',
+        ])
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
     confound_cli = confound / "rabies_confound_correction.pkl"
@@ -1046,21 +1073,29 @@ def generate_subject_script(
             "  exit 1",
             "fi",
         ])
-    lines.extend([
-        f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
-        f"  {_shell_command(preprocess_command)}",
-        "fi",
-        f"mkdir -p {shlex.quote(str(preprocess_archive))}",
-        f"if [[ -f {shlex.quote(str(preprocess_workflow))} ]]; then",
-        f"  cp -f {shlex.quote(str(preprocess_workflow))} {shlex.quote(str(preprocess_archive))}/",
-        "fi",
-        f"if [[ -f {shlex.quote(str(preprocess / 'rabies_preprocess.log'))} ]]; then",
-        f"  cp -f {shlex.quote(str(preprocess / 'rabies_preprocess.log'))} {shlex.quote(str(preprocess_archive))}/",
-        "fi",
-        f"if [[ -d {shlex.quote(str(preprocess / 'preprocess_QC_report'))} && ! -d {shlex.quote(str(preprocess_archive / 'preprocess_QC_report'))} ]]; then",
-        f"  cp -a {shlex.quote(str(preprocess / 'preprocess_QC_report'))} {shlex.quote(str(preprocess_archive))}/",
-        "fi",
-    ])
+    if pipeline == "fixrabies_prepare_only":
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+            f'  echo "Preprocessing output is missing for $subject session $session_name: {preprocess_workflow}" >&2',
+            "  exit 1",
+            "fi",
+        ])
+    else:
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+            f"  {_shell_command(preprocess_command)}",
+            "fi",
+            f"mkdir -p {shlex.quote(str(preprocess_archive))}",
+            f"if [[ -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+            f"  cp -f {shlex.quote(str(preprocess_workflow))} {shlex.quote(str(preprocess_archive))}/",
+            "fi",
+            f"if [[ -f {shlex.quote(str(preprocess / 'rabies_preprocess.log'))} ]]; then",
+            f"  cp -f {shlex.quote(str(preprocess / 'rabies_preprocess.log'))} {shlex.quote(str(preprocess_archive))}/",
+            "fi",
+            f"if [[ -d {shlex.quote(str(preprocess / 'preprocess_QC_report'))} && ! -d {shlex.quote(str(preprocess_archive / 'preprocess_QC_report'))} ]]; then",
+            f"  cp -a {shlex.quote(str(preprocess / 'preprocess_QC_report'))} {shlex.quote(str(preprocess_archive))}/",
+            "fi",
+        ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.extend([
             'mkdir -p "$confound"',
@@ -1077,7 +1112,7 @@ def generate_subject_script(
             f"  cp -f {shlex.quote(str(confound / 'rabies_confound_correction.log'))} {shlex.quote(str(confound_archive))}/",
             "fi",
         ])
-    if pipeline == "fixrabies_prepare":
+    if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         assert fix_dir is not None
         assert fix_marker is not None
         assert fix_prepare_command is not None
@@ -1129,10 +1164,11 @@ def generate_subject_script(
         ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.append('if [[ -d "$confound" ]]; then find "$confound" -mindepth 1 -delete; fi')
-    lines.extend([
-        'mkdir -p "$session_archive"',
-        'cp -a "$bids/." "$session_archive/"',
-    ])
+    if pipeline != "fixrabies_prepare_only":
+        lines.extend([
+            'mkdir -p "$session_archive"',
+            'cp -a "$bids/." "$session_archive/"',
+        ])
     lines.extend(['echo "Finished subject $subject"', ""])
     return "\n".join(lines)
 
@@ -1482,7 +1518,17 @@ class SubjectManager(QMainWindow):
         self.fix_directory_selector.setToolTip(
             "Create a new shared project-level folder or add these subjects to an existing FIXRABIES folder."
         )
+        self.fix_directory_name = QLineEdit()
+        self.fix_directory_name.setPlaceholderText(
+            "Optional custom name; blank uses an automatic name"
+        )
+        self.fix_directory_name.setToolTip(
+            "Name a new FIX folder inside the project root. Enter one folder name, not a path."
+        )
         self.pipeline_selector.currentIndexChanged.connect(
+            self._update_fix_controls
+        )
+        self.fix_directory_selector.currentIndexChanged.connect(
             self._update_fix_controls
         )
         create_scripts = QPushButton("Create script")
@@ -1494,7 +1540,9 @@ class SubjectManager(QMainWindow):
         fix_options.addWidget(QLabel("FIX species:"))
         fix_options.addWidget(self.fix_species_selector)
         fix_options.addWidget(QLabel("FIX folder:"))
-        fix_options.addWidget(self.fix_directory_selector, 1)
+        fix_options.addWidget(self.fix_directory_selector)
+        fix_options.addWidget(QLabel("New folder name:"))
+        fix_options.addWidget(self.fix_directory_name, 1)
         layout.addLayout(fix_options)
 
         cleanup_options = QHBoxLayout()
@@ -1527,9 +1575,15 @@ class SubjectManager(QMainWindow):
         return self.setup_window._project_paths()
 
     def _update_fix_controls(self, _index: int = -1) -> None:
-        enabled = self.pipeline_selector.currentData() == "fixrabies_prepare"
+        enabled = self.pipeline_selector.currentData() in {
+            "fixrabies_prepare",
+            "fixrabies_prepare_only",
+        }
         self.fix_species_selector.setEnabled(enabled)
         self.fix_directory_selector.setEnabled(enabled)
+        self.fix_directory_name.setEnabled(
+            enabled and self.fix_directory_selector.currentData() == FIX_CREATE_NEW
+        )
 
     def _refresh_fix_directory_options(self, project_root: Path) -> None:
         selected = self.fix_directory_selector.currentData()
@@ -2121,18 +2175,22 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["output"].text().strip():
             QMessageBox.critical(self, "Output directory not set", "Select a project root or set an output directory.")
             return
-        if not self.path_fields["results"].text().strip():
+        if (
+            pipeline != "fixrabies_prepare_only"
+            and not self.path_fields["results"].text().strip()
+        ):
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
-        if not templates.is_dir():
-            QMessageBox.critical(self, "Templates not found", f"Template directory does not exist: {templates}")
-            return
-        if not image.is_file():
-            QMessageBox.critical(self, "RABIES image not found", f"Apptainer image does not exist: {image}")
-            return
+        if pipeline != "fixrabies_prepare_only":
+            if not templates.is_dir():
+                QMessageBox.critical(self, "Templates not found", f"Template directory does not exist: {templates}")
+                return
+            if not image.is_file():
+                QMessageBox.critical(self, "RABIES image not found", f"Apptainer image does not exist: {image}")
+                return
         fix_dir = None
         create_fix_dir = False
-        if pipeline == "fixrabies_prepare":
+        if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
             if not project_root.is_dir():
                 QMessageBox.critical(
                     self,
@@ -2142,7 +2200,23 @@ class SubjectManager(QMainWindow):
                 return
             selected_fix_dir = self.fix_directory_selector.currentData()
             if selected_fix_dir == FIX_CREATE_NEW:
-                fix_dir = suggested_fix_directory(project_root)
+                folder_name = self.fix_directory_name.text().strip()
+                if folder_name:
+                    try:
+                        folder_name = _validate_fix_directory_name(folder_name)
+                    except ValueError as error:
+                        QMessageBox.critical(self, "Invalid FIX folder name", str(error))
+                        return
+                    fix_dir = project_root / folder_name
+                    if fix_dir.exists():
+                        QMessageBox.critical(
+                            self,
+                            "FIX folder already exists",
+                            f"Choose the existing folder from the FIX folder selector or enter another name: {fix_dir}",
+                        )
+                        return
+                else:
+                    fix_dir = suggested_fix_directory(project_root)
                 create_fix_dir = True
             elif selected_fix_dir:
                 fix_dir = Path(selected_fix_dir)
@@ -2170,6 +2244,19 @@ class SubjectManager(QMainWindow):
                     subject_dir
                 ).items():
                     session_name = _session_result_name(session)
+                    if pipeline == "fixrabies_prepare_only":
+                        preprocess_dir = (
+                            output / "func_preprocess" / subject / session_name
+                        )
+                        preprocess_workflow = _workflow_path(
+                            preprocess_dir, "preprocess"
+                        )
+                        if not preprocess_workflow.is_file():
+                            raise ValueError(
+                                f"Preprocessing output is missing for "
+                                f"{subject}/{session}: {preprocess_workflow}. "
+                                "Run preprocessing first."
+                            )
                     script = generate_subject_script(
                         subject,
                         bold_files,
@@ -2190,7 +2277,7 @@ class SubjectManager(QMainWindow):
                         script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
                         script,
                     ))
-            if pipeline == "fixrabies_prepare":
+            if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
                 assert fix_dir is not None
                 if create_fix_dir:
                     fix_dir.mkdir()
@@ -2201,7 +2288,7 @@ class SubjectManager(QMainWindow):
                 script_path.parent.mkdir(parents=True, exist_ok=True)
                 script_path.write_text(script, encoding="utf-8")
                 script_path.chmod(0o755)
-            if pipeline == "fixrabies_prepare":
+            if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
                 for row in range(self.subjects.rowCount()):
                     subject_item = self.subjects.item(row, 0)
                     if subject_item is None or subject_item.text() not in selected:
@@ -2218,6 +2305,8 @@ class SubjectManager(QMainWindow):
                         )
                     self.subjects.setItem(row, 7, folder_item)
                 self._refresh_fix_directory_options(project_root)
+                if create_fix_dir:
+                    self.fix_directory_name.clear()
                 selected_fix_index = self.fix_directory_selector.findData(
                     str(fix_dir)
                 )
@@ -2254,6 +2343,8 @@ class SubjectManager(QMainWindow):
             QMessageBox.information(self, "No subjects selected", "Select at least one subject first.")
             return
         _, output, results, _, _ = self._project_paths()
+        pipeline = self.pipeline_selector.currentData()
+        pipeline_label = self.pipeline_selector.currentText()
         bids_dir = self._selected_bids_dir()
         if bids_dir is None or not bids_dir.is_dir():
             QMessageBox.critical(
@@ -2264,23 +2355,29 @@ class SubjectManager(QMainWindow):
         if not self.path_fields["output"].text().strip():
             QMessageBox.critical(self, "Output directory not set", "Select a project root or set an output directory.")
             return
-        if not self.path_fields["results"].text().strip():
+        if (
+            pipeline != "fixrabies_prepare_only"
+            and not self.path_fields["results"].text().strip()
+        ):
             QMessageBox.critical(self, "Results directory not set", "Select a project root or set a results directory.")
             return
-        pipeline = self.pipeline_selector.currentData()
-        pipeline_label = self.pipeline_selector.currentText()
         session_filter = (
             {selected[0]: set(selected_session_names)}
             if selected_session_names
             else None
         )
-        try:
-            orientation_issues = nifti_orientation_issues(
-                bids_dir, selected, session_filter
-            )
-        except OSError as error:
-            QMessageBox.critical(self, "Could not check NIfTI orientations", str(error))
-            return
+        if pipeline == "fixrabies_prepare_only":
+            orientation_issues = []
+        else:
+            try:
+                orientation_issues = nifti_orientation_issues(
+                    bids_dir, selected, session_filter
+                )
+            except OSError as error:
+                QMessageBox.critical(
+                    self, "Could not check NIfTI orientations", str(error)
+                )
+                return
         if orientation_issues:
             QMessageBox.critical(
                 self,
@@ -2315,13 +2412,13 @@ class SubjectManager(QMainWindow):
                 try:
                     fix_dir = (
                         fix_directory_from_script(script_path)
-                        if pipeline == "fixrabies_prepare"
+                        if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}
                         else None
                     )
                 except (OSError, ValueError) as error:
                     missing.append(f"{script_path}: {error}")
                     continue
-                if pipeline == "fixrabies_prepare" and fix_dir is None:
+                if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"} and fix_dir is None:
                     missing.append(
                         f"{script_path}: no shared FIXRABIES directory is configured"
                     )
@@ -2333,7 +2430,7 @@ class SubjectManager(QMainWindow):
                 else:
                     script_paths.append(script_path)
         if not script_paths and blocked_sessions:
-            if pipeline == "fixrabies_prepare":
+            if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
                 explanation = (
                     "No session jobs can be submitted because prepared scan data "
                     "already exists in the shared FIXRABIES folder for:\n"
@@ -2350,7 +2447,7 @@ class SubjectManager(QMainWindow):
             QMessageBox.critical(
                 self,
                 "FIXRABIES scans already prepared"
-                if pipeline == "fixrabies_prepare"
+                if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}
                 else "Session results must be cleared",
                 explanation,
             )
