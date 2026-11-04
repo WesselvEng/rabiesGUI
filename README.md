@@ -151,7 +151,9 @@ selected preprocessing and analysis stages once across the dataset, including
 the configured group ICA for the full pipeline, instead of repeating them
 separately for each subject. Results and workflow markers remain under
 `<results directory>/cohort/`, allowing a rerun of the script to skip completed
-stages and resume incomplete ones. Before the first stage, the job copies the
+stages and resume incomplete ones. The cohort script retains its stage outputs
+in this directory; the **Delete archived outputs from rabies_output** checkbox
+applies only to subject/session scripts. Before the first stage, the job copies the
 selected BIDS tree once to `<results directory>/cohort/input_bids/`, preserving
 each `sub-*/ses-*` layout. RABIES then runs against that archived BIDS tree, so
 the exact inputs are retained with the cohort outputs and are not recopied per
