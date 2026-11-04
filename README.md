@@ -73,10 +73,16 @@ assignments for scripts that have not yet run. Prepared scan data is stored
 under `<project root>/<FIX folder>/data/`. The generated jobs serialize FIX
 preparation with a shared lock, so they can be submitted together without
 running their FIX workflows concurrently against the same directory.
+The **Delete archived outputs from rabies_output** checkbox is enabled by
+default, preserving the existing behavior of clearing analysis and confound
+output from `rabies_output` after it has been copied to `rabies_results`.
+Uncheck it when creating scripts to retain the complete workflow output.
 Choose **FIXRABIES prepare only** to create jobs that run only `fixrabies
 prepare` against existing per-session preprocessing outputs. The GUI checks
 that each selected subject/session has a preprocessing workflow before creating
-these scripts. Choose **Submit scripts with sbatch** and select which pipeline
+these scripts. These jobs request 4 GB of memory and 4 CPUs; the combined
+preprocessing-plus-FIX variant retains its 8 GB request. Choose **Submit
+scripts with sbatch** and select which pipeline
 variant to submit. With no session rows selected, it
 submits eligible sessions for the selected subjects and skips sessions that
 already have results for that pipeline's stages. If session rows are selected,

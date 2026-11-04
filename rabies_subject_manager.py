@@ -18,6 +18,7 @@ from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -918,6 +919,7 @@ def generate_subject_script(
     pipeline: str = "whole_pipeline",
     fix_species: str = "ratSIGMA",
     fix_dir: Path | None = None,
+    delete_output_after_archive: bool = True,
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
@@ -1034,7 +1036,7 @@ def generate_subject_script(
     lines = [
         "#!/usr/bin/env bash",
         "#SBATCH --time=12:00:00",
-        "#SBATCH --mem=8G",
+        f"#SBATCH --mem={'4G' if pipeline == 'fixrabies_prepare_only' else '8G'}",
         "#SBATCH --cpus-per-task=4",
         "set -euo pipefail",
         f"subject={shlex.quote(subject)}",
@@ -1179,11 +1181,18 @@ def generate_subject_script(
             "  fi",
             f"  mkdir -p {shlex.quote(str(analysis_archive))}",
             f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
-            "  find \"$analysis\" -mindepth 1 -delete",
+            *(
+                ['  find "$analysis" -mindepth 1 -delete']
+                if delete_output_after_archive
+                else []
+            ),
             "fi",
         ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
-        lines.append('if [[ -d "$confound" ]]; then find "$confound" -mindepth 1 -delete; fi')
+        if delete_output_after_archive:
+            lines.append(
+                'if [[ -d "$confound" ]]; then find "$confound" -mindepth 1 -delete; fi'
+            )
     if pipeline != "fixrabies_prepare_only":
         lines.extend([
             'mkdir -p "$session_archive"',
@@ -1564,7 +1573,21 @@ class SubjectManager(QMainWindow):
         create_scripts = QPushButton("Create script")
         create_scripts.clicked.connect(self.create_scripts)
         options.addWidget(create_scripts)
+        self.delete_output_after_archive = QCheckBox(
+            "Delete archived outputs from rabies_output"
+        )
+        self.delete_output_after_archive.setChecked(True)
+        self.delete_output_after_archive.setToolTip(
+            "Remove archived analysis and confound output from rabies_output "
+            "after it has been copied to rabies_results. Uncheck to keep the "
+            "complete workflow output."
+        )
         layout.addLayout(options)
+
+        archive_options = QHBoxLayout()
+        archive_options.addWidget(self.delete_output_after_archive)
+        archive_options.addStretch()
+        layout.addLayout(archive_options)
 
         fix_options = QHBoxLayout()
         fix_options.addWidget(QLabel("FIX species:"))
@@ -2298,6 +2321,9 @@ class SubjectManager(QMainWindow):
                         preprocess_args=self.stage_args["Preprocessing"],
                         confound_args=self.stage_args["Confound correction"],
                         analysis_args=self.stage_args["Analysis"],
+                        delete_output_after_archive=(
+                            self.delete_output_after_archive.isChecked()
+                        ),
                         session=session,
                         pipeline=pipeline,
                         fix_species=self.fix_species_selector.currentText(),
