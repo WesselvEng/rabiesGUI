@@ -8,9 +8,9 @@ orientations, and creating or submitting RABIES/FIXRABIES SLURM jobs:
   preprocessing-plus-confound, full-pipeline, and preprocessing-plus-FIXRABIES
   prepare variants for each session, plus a FIXRABIES-prepare-only variant for
   subjects whose preprocessing outputs already exist.
-- `rabies_cohort_manager.py` creates one cohort-wide job for the full selected
-  BIDS dataset, using RABIES' native subject/session handling, with the same
-  four pipeline variants.
+- `rabies_cohort_manager.py` provides the same subject/session tools and
+  per-session job variants, plus one cohort-wide job for the full selected
+  BIDS dataset using RABIES' native subject/session handling.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -46,15 +46,16 @@ When launched from a terminal, the current working directory is used as the
 initial project root. If it contains a `bids/` folder with subject directories
 matching the selected subject prefix, that folder is selected as the original
 BIDS folder automatically.
-The subject manager displays `RABIES-RABIES.png` as a splash image while it
-starts. Keep the image beside `rabies_subject_manager.py`; if it is missing or
-cannot be loaded, the GUI starts normally without a splash.
+Both managers display `RABIES-RABIES.png` as a splash image while they start.
+Keep the image beside the Python scripts; if it is missing or cannot be loaded,
+the GUI starts normally without a splash.
 
-The instructions below describe the cohort-wide manager,
-`rabies_cohort_manager.py`. For independent per-session jobs, launch
-`rabies_subject_manager.py` instead and create/submit scripts for the selected
-subjects. It creates a separate `scrip_<subject>_<session>.sh` for each
-session for the pipeline selected in the dropdown next to **Create script**.
+The cohort-wide manager,
+`rabies_cohort_manager.py`, includes the subject/session controls described
+below as well as separate cohort-wide script controls. For independent
+per-session jobs, create/submit scripts for the selected subjects. It creates a
+separate `scrip_<subject>_<session>.sh` for each session for the pipeline
+selected in the dropdown next to **Create script**.
 Scripts are saved under
 `<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare,fixrabies_prepare_only}/`.
 Standard pipeline scripts stage only that session's BOLD/T2w files and write
@@ -104,10 +105,11 @@ does not have to be named `og_bids`. Select **Open subject manager** to move
 to the separate subject window. Use **Project setup…** there to return to the
 setup window and apply different paths.
 
-The subject window contains the subject table, stage status, script controls,
-cleanup actions, and cleaned-timeseries tools. It shows BOLD and T2w scan
-counts and the status of preprocessing, confound correction, analysis, and
-FIXRABIES preparation.
+The subject/session manager contains the subject table, per-session stage
+status, script controls, cleanup actions, and cleaned-timeseries tools. It
+shows BOLD and T2w scan counts and the status of preprocessing, confound
+correction, analysis, and FIXRABIES preparation. In the cohort manager, a
+separate status line reports cohort-wide stage completion.
 Select a subject to view its sessions, every NIfTI's orientation, whether the
 session input archive is present, and the applicable session or cohort stage
 results. NIfTI files under a session's `mrs/` directory are ignored by subject
@@ -125,17 +127,18 @@ inputs and stage outputs cannot become inconsistent.
 
 RABIES stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. FIXRABIES status is based on prepared scan
-directories in the selected project's shared FIX folder for the subject
-manager. The subject table also lists shared FIX folders assigned to each
-subject. In the cohort manager, FIXRABIES status remains based on prepared scan
-directories under `<results directory>/cohort/fixrabies/data/`; status is
-cohort-wide and is shown for every subject row.
+directories in the selected project's shared FIX folder for per-session jobs.
+The subject table also lists shared FIX folders assigned to each subject. The
+cohort manager's separate cohort-wide status line reports completion from
+`<results directory>/cohort/`, including FIXRABIES scan data under
+`<results directory>/cohort/fixrabies/data/`.
 
-Choose the pipeline in the dropdown next to **Create script**, then create the
-cohort script under
+Use the dropdown next to **Create script** for per-session jobs. For one
+cohort-wide job, choose a pipeline from the **Cohort-wide job** dropdown and
+select **Create cohort script**. Cohort scripts are saved under
 `<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare}/`.
-Choose **Submit cohort with sbatch** to submit the currently selected variant
-as one job for every subject and session in the selected BIDS folder.
+Choose **Submit cohort with sbatch** to submit the selected cohort-wide
+variant as one job for every subject and session in the selected BIDS folder.
 Selection in the subject table is only for viewing subject details and
 reorienting selected files; it does not narrow the analysis cohort. Each
 script runs preprocessing only, preprocessing followed by confound correction,
@@ -189,7 +192,7 @@ the same name already exists.
 The cohort job expects `*_bold.nii.gz` and `*_T2w.nii.gz` files in BIDS
 structure and RABIES 0.6.3. The default stage arguments use the SIGMA rat template
 layout. When selecting mouse or custom templates, use **RABIES arguments…** in
-the subject window to set the corresponding template and atlas file paths, and
+the manager to set the corresponding template and atlas file paths, and
 review the generated scripts before submission.
 
 # Setting up the work environment

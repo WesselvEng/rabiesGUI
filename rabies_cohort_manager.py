@@ -8,13 +8,14 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 import nibabel as nib
 from nibabel.filebasedimages import ImageFileError
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -31,12 +32,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplashScreen,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+
+import rabies_subject_manager as _subject_manager
 
 
 DEFAULT_RABIES_IMAGE = ""
@@ -594,6 +598,7 @@ def generate_cohort_script(
     analysis_args: str = ANALYSIS_ARGS,
     pipeline: str = "whole_pipeline",
     fix_species: str = "ratSIGMA",
+    subject_prefix: str = "sub-",
 ) -> str:
     """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
@@ -602,7 +607,7 @@ def generate_cohort_script(
         raise ValueError(
             "The cohort results directory must not be inside the input BIDS directory."
         )
-    subjects = discover_subjects(bids_dir)
+    subjects = discover_subjects(bids_dir, subject_prefix)
     if not subjects:
         raise ValueError(f"No BIDS subjects found in {bids_dir}.")
     if pipeline not in {variant for _, variant in PIPELINE_VARIANTS}:
@@ -915,7 +920,7 @@ def generate_subject_script(
     return "\n".join(lines)
 
 
-class ProjectSetupWindow(QMainWindow):
+class _LegacyProjectSetupWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("RABIES Project Setup")
@@ -1144,7 +1149,7 @@ class ProjectSetupWindow(QMainWindow):
         self.subject_manager.activateWindow()
 
 
-class SubjectManager(QMainWindow):
+class _LegacySubjectManager(QMainWindow):
     def __init__(self, setup_window: ProjectSetupWindow) -> None:
         super().__init__()
         self.setup_window = setup_window
@@ -1789,7 +1794,8 @@ class SubjectManager(QMainWindow):
             return
         script_root = output / "tmp_script"
         try:
-            subject_count = len(discover_subjects(bids_dir))
+            subject_prefix = self.path_fields["subject_prefix"].text().strip()
+            subject_count = len(discover_subjects(bids_dir, subject_prefix))
             script = generate_cohort_script(
                 bids_dir,
                 results,
@@ -1800,6 +1806,7 @@ class SubjectManager(QMainWindow):
                 analysis_args=self.stage_args["Analysis"],
                 pipeline=pipeline,
                 fix_species=self.fix_species_selector.currentText(),
+                subject_prefix=subject_prefix,
             )
             script_path = script_root / pipeline / "scrip_cohort.sh"
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1838,11 +1845,12 @@ class SubjectManager(QMainWindow):
         orientation_source = results / "cohort" / "input_bids"
         if not orientation_source.is_dir():
             orientation_source = bids_dir
+        subject_prefix = self.path_fields["subject_prefix"].text().strip()
         try:
             subjects = [
                 subject
                 for subject, _bold_count, _anat_count in discover_subjects(
-                    orientation_source
+                    orientation_source, subject_prefix
                 )
             ]
         except (OSError, ValueError) as error:
@@ -1929,10 +1937,189 @@ class SubjectManager(QMainWindow):
         QMessageBox.information(self, "Jobs submitted", "\n".join(submitted))
 
 
-if __name__ == "__main__":
+class SubjectManager(_subject_manager.SubjectManager):
+    def __init__(self, setup_window: ProjectSetupWindow) -> None:
+        super().__init__(setup_window)
+        self.setWindowTitle("RABIES Cohort Manager")
+
+    def _build_ui(self) -> None:
+        super()._build_ui()
+        self.status.setText(
+            "Create per-session jobs or one cohort-wide job for the selected BIDS folder."
+        )
+        self.subjects.setHorizontalHeaderLabels(
+            [
+                "Subject",
+                "BOLD scans",
+                "T2w scans",
+                "Subject preprocess",
+                "Subject confound",
+                "Subject analysis",
+                "Subject FIXRABIES",
+                "FIX folder(s)",
+            ]
+        )
+        self.session_details.setHorizontalHeaderLabels(
+            [
+                "Session",
+                "NIfTI orientations",
+                "Session input",
+                "Cohort preprocess",
+                "Cohort confound",
+                "Cohort analysis",
+                "FIXRABIES prepare",
+            ]
+        )
+        layout = self.centralWidget().layout()
+        if layout is None:
+            raise RuntimeError("The subject manager central widget has no layout.")
+        self.cohort_stage_label = QLabel()
+        layout.insertWidget(1, self.cohort_stage_label)
+
+        cohort_options = QHBoxLayout()
+        cohort_options.addWidget(QLabel("Cohort-wide job:"))
+        self.cohort_pipeline_selector = QComboBox()
+        for label, pipeline in PIPELINE_VARIANTS:
+            self.cohort_pipeline_selector.addItem(label, pipeline)
+        cohort_options.addWidget(self.cohort_pipeline_selector)
+        cohort_options.addWidget(QLabel("FIX species:"))
+        self.cohort_fix_species_selector = QComboBox()
+        self.cohort_fix_species_selector.addItems(FIXRABIES_SPECIES)
+        self.cohort_fix_species_selector.setEnabled(False)
+        self.cohort_fix_species_selector.setToolTip(
+            "Choose the FIXRABIES species that matches the RABIES common-space template."
+        )
+        self.cohort_pipeline_selector.currentIndexChanged.connect(
+            lambda _index: self.cohort_fix_species_selector.setEnabled(
+                self.cohort_pipeline_selector.currentData() == "fixrabies_prepare"
+            )
+        )
+        cohort_options.addWidget(self.cohort_fix_species_selector)
+        for label, callback in (
+            ("Create cohort script", self.create_cohort_script),
+            ("Submit cohort with sbatch", self.submit_cohort_script),
+            ("Remove cohort scripts", self.remove_cohort_scripts),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            cohort_options.addWidget(button)
+        layout.addLayout(cohort_options)
+
+    def refresh_subjects(self) -> None:
+        super().refresh_subjects()
+        self._refresh_cohort_status()
+
+    def _refresh_cohort_status(self) -> None:
+        results_value = self.path_fields["results"].text().strip()
+        if not results_value:
+            self.cohort_stage_label.setText("Cohort-wide stages: results directory not set.")
+            return
+        try:
+            states = cohort_stage_status(Path(results_value).expanduser())
+        except OSError as error:
+            QMessageBox.critical(
+                self, "Could not read cohort stage status", str(error)
+            )
+            return
+        labels = (
+            ("Preprocess", "preprocess"),
+            ("Confound", "confound"),
+            ("Analysis", "analysis"),
+            ("FIXRABIES", "fixrabies"),
+        )
+        status = " | ".join(
+            f"{label}: {'Complete' if states[key] else 'Not found'}"
+            for label, key in labels
+        )
+        self.cohort_stage_label.setText(f"Cohort-wide stages: {status}")
+
+    def _show_session_details(
+        self,
+        current_row: int,
+        current_column: int,
+        previous_row: int,
+        previous_column: int,
+    ) -> None:
+        _LegacySubjectManager._show_session_details(
+            self, current_row, current_column, previous_row, previous_column
+        )
+
+    def _run_cohort_action(self, callback: Callable[[], None]) -> None:
+        pipeline = self.cohort_pipeline_selector.currentData()
+        pipeline_index = self.pipeline_selector.findData(pipeline)
+        if pipeline_index < 0:
+            QMessageBox.critical(
+                self, "Unsupported cohort pipeline", f"Unsupported pipeline: {pipeline}"
+            )
+            return
+        previous_pipeline_index = self.pipeline_selector.currentIndex()
+        previous_species = self.fix_species_selector.currentText()
+        self.pipeline_selector.setCurrentIndex(pipeline_index)
+        self.fix_species_selector.setCurrentText(
+            self.cohort_fix_species_selector.currentText()
+        )
+        try:
+            callback()
+        finally:
+            self.pipeline_selector.setCurrentIndex(previous_pipeline_index)
+            self.fix_species_selector.setCurrentText(previous_species)
+            self._refresh_cohort_status()
+
+    def create_cohort_script(self) -> None:
+        self._run_cohort_action(
+            lambda: _LegacySubjectManager.create_scripts(self)
+        )
+
+    def submit_cohort_script(self) -> None:
+        self._run_cohort_action(
+            lambda: _LegacySubjectManager.submit_scripts(self)
+        )
+
+    def remove_cohort_scripts(self) -> None:
+        _LegacySubjectManager.remove_scripts(self)
+
+    def _clear_results(self, subjects: list[str] | None) -> None:
+        _LegacySubjectManager._clear_results(self, subjects)
+
+
+class ProjectSetupWindow(_subject_manager.ProjectSetupWindow):
+    def open_subject_manager(self) -> None:
+        _LegacyProjectSetupWindow.open_subject_manager(self)
+
+
+def main() -> None:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication([])
     configure_dark_mode(app)
+    splash_pixmap = QPixmap(str(_subject_manager.SPLASH_IMAGE))
+    splash: QSplashScreen | None = None
+    if not splash_pixmap.isNull():
+        splash_pixmap = splash_pixmap.scaled(
+            640,
+            480,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        splash_screen = QSplashScreen(
+            splash_pixmap, Qt.WindowType.WindowStaysOnTopHint
+        )
+        splash_screen.show()
+        splash = splash_screen
+        app.processEvents()
+
     window = ProjectSetupWindow()
-    window.show()
+    if splash is not None:
+        splash_screen = splash
+
+        def show_main_window() -> None:
+            window.show()
+            splash_screen.finish(window)
+
+        QTimer.singleShot(3000, show_main_window)
+    else:
+        window.show()
     app.exec()
+
+
+if __name__ == "__main__":
+    main()
