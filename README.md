@@ -127,10 +127,11 @@ shows BOLD and T2w scan counts and the status of preprocessing, confound
 correction, analysis, and FIXRABIES preparation. In cohort mode, a separate
 status line reports cohort-wide stage completion.
 Select a subject to view its sessions, every RABIES-relevant NIfTI's
-orientation, whether the session input archive is present, and the applicable
-session or cohort stage results. Data under a session's `mrs/` directory is
-ignored by scan counts, orientation checks/reorientation, and both session and
-cohort RABIES inputs; MRS data is not processed by RABIES. Script
+orientation, the input source, and the applicable session or cohort stage
+results. Data under a session's `mrs/` directory is ignored by scan counts and
+orientation checks/reorientation. RABIES' default BIDS filters select
+functional `bold`/`cbv` and anatomical `T1w`/`T2w` suffixes, so MRS files are
+not selected. Script
 creation is allowed regardless of orientation, but job submission is blocked
 if any BIDS NIfTI is unreadable or is not in RAS orientation. Orientation
 entries show a concise session/modality label; hover over an entry to see its
@@ -138,8 +139,8 @@ full path. Use **Reorient selected NIfTIs to RAS** to convert non-RAS files.
 The GUI asks for confirmation, preserves originals in a timestamped
 `<BIDS folder>_orientation_backups` directory beside the BIDS folder, and
 replaces the input files with RAS-oriented copies. If a cohort input snapshot
-already exists, clear all results before changing orientations so the archived
-inputs and stage outputs cannot become inconsistent.
+already exists from an older GUI script, new cohort jobs read the selected
+original BIDS folder instead; the old snapshot is not used.
 
 RABIES stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. FIXRABIES status is based on prepared scan
@@ -164,26 +165,23 @@ the whole RABIES pipeline (including analysis), or preprocessing followed by
 passed to the prepare command, which converts the RABIES preprocessing outputs
 into FIX-compatible scan directories under
 `<output directory>/cohort/fixrabies/data/`, then runs MELODIC and extracts
-FIX features. Each script archives the RABIES-relevant BIDS tree, omitting
-session `mrs/` folders, then passes that archived BIDS root to RABIES, which
-discovers and pairs subject/session scans using its native BIDS handling.
+FIX features. Each script passes the selected original BIDS directory to
+RABIES as a read-only input. RABIES discovers and pairs subject/session scans
+using its native BIDS handling; it does not need a copied BIDS snapshot.
 RABIES runs the selected preprocessing and analysis stages once across the
 dataset, including the configured group ICA for the full pipeline, instead of
-repeating them separately for each subject. The cohort input snapshot excludes
-`sub-*/ses-*/mrs/` directories and skips the configured output and results
-folders if they are located inside the selected BIDS directory. Results and
-workflow markers remain under `<results directory>/cohort/`, allowing a rerun
-of the script to skip completed stages and resume incomplete ones. Working
-stage outputs are under
-`<output directory>/cohort/`; the delete-after-archive option removes these
-working copies only after they have been archived. Before the first stage, the
-job copies the selected BIDS tree once to
-`<results directory>/cohort/input_bids/`, preserving each `sub-*/ses-*` layout
-but omitting `mrs/` folders. RABIES then runs against that archived BIDS tree,
-so the inputs used by RABIES are retained with the cohort outputs and are not
-recopied per subject. An existing cohort input snapshot is reused; clear all
-results before creating a new cohort run if you need to replace a snapshot
-created before MRS exclusion was added.
+repeating them separately for each subject. Results and workflow markers
+remain under `<results directory>/cohort/`, allowing a rerun of the script to
+skip completed stages and resume incomplete ones. Working stage outputs are
+under `<output directory>/cohort/`; the delete-after-archive option removes
+these working copies only after they have been copied to the results
+directory. The selected BIDS directory must be separate from both output and
+results directories.
+
+The `.input_bids.*` temporary directories were created by the older custom
+snapshot step in generated cohort scripts. New scripts do not create them.
+Regenerate previously created cohort scripts before submitting another job;
+do not remove a staging directory while an older job may still be running.
 
 Use **Clear ALL results** to remove every item inside the results directory,
 including the shared cohort outputs and cleaned timeseries. Cohort stages share

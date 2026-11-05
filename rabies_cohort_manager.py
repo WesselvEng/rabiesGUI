@@ -666,24 +666,24 @@ def generate_cohort_script(
         else results_dir.parent / "rabies_outputs"
     )
     cohort_output = output_root / "cohort"
-    if any(
-        bids_dir == path or path in bids_dir.parents
-        for path in (cohort_archive, cohort_output)
-    ):
-        raise ValueError(
-            "Cohort working and results directories must not overlap the input BIDS directory."
-        )
+    for path in (output_root, results_dir):
+        if (
+            bids_dir == path
+            or bids_dir in path.parents
+            or path in bids_dir.parents
+        ):
+            raise ValueError(
+                "The output and results directories must be outside and separate "
+                "from the input BIDS directory."
+            )
     if (
-        cohort_output == cohort_archive
-        or cohort_output in cohort_archive.parents
-        or cohort_archive in cohort_output.parents
+        output_root == results_dir
+        or output_root in results_dir.parents
+        or results_dir in output_root.parents
     ):
         raise ValueError(
-            "Cohort working outputs and archived results must be separate directories."
+            "The output and results directories must be separate."
         )
-    find_source_command = _gui_core.bids_snapshot_find_command(
-        bids_dir, (output_root, results_dir)
-    )
     subjects = discover_subjects(bids_dir, subject_prefix)
     if not subjects:
         raise ValueError(f"No BIDS subjects found in {bids_dir}.")
@@ -696,7 +696,6 @@ def generate_cohort_script(
     confound = cohort_output / "confound"
     analysis = cohort_output / "analysis"
     fix_dir = cohort_output / "fixrabies"
-    archived_bids = cohort_archive / "input_bids"
     preprocess_archive = cohort_archive / "preprocess"
     confound_archive = cohort_archive / "confound"
     analysis_archive = cohort_archive / "analysis"
@@ -717,7 +716,7 @@ def generate_cohort_script(
 
     command_base = ["apptainer", "run"]
     preprocess_command = command_base + [
-        "-B", bind(archived_bids, "/input_bids", True),
+        "-B", bind(bids_dir, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(templates_dir, "/templates", True),
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
@@ -725,7 +724,7 @@ def generate_cohort_script(
         "/input_bids/", "/preprocess_outputs/",
     ] + shlex.split(_expand_template_paths(preprocess_args, templates))
     confound_command = command_base + [
-        "-B", bind(archived_bids, "/input_bids", True),
+        "-B", bind(bids_dir, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(confound, "/confound_correction_outputs"),
         "-B", bind(templates_dir, "/templates", True),
@@ -734,7 +733,7 @@ def generate_cohort_script(
         "/preprocess_outputs/", "/confound_correction_outputs/",    
     ] + shlex.split(confound_args)
     analysis_command = command_base + [
-        "-B", bind(archived_bids, "/input_bids", True),
+        "-B", bind(bids_dir, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs", True),
         "-B", bind(confound, "/confound_correction_outputs"),
         "-B", bind(analysis, "/analysis_outputs"),
@@ -778,25 +777,18 @@ def generate_cohort_script(
         f"fix_dir={shlex.quote(str(fix_dir))}",
         f"fix_archive={shlex.quote(str(fix_archive))}",
         f"bids_source={shlex.quote(str(bids_dir))}",
-        f"archived_bids={shlex.quote(str(archived_bids))}",
         'for output_path in "$cohort" "$cohort_archive"; do',
         '  if [[ -L "$output_path" ]]; then',
         '    echo "Refusing to use symlinked cohort output path: $output_path" >&2',
         "    exit 1",
         "  fi",
         "done",
-        'mkdir -p "$cohort" "$cohort_archive" "$preprocess"',
-        'bids_staging=""',
-        'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
-        'if [[ ! -d "$archived_bids" ]]; then',
-        '  bids_staging=$(mktemp -d "$cohort_archive/.input_bids.XXXXXX")',
-        f'  (cd "$bids_source" && {find_source_command}) '
-        '| tar --null -T - -cf - '
-        '| tar -C "$bids_staging" -xf -',
-        '  mv "$bids_staging" "$archived_bids"',
-        '  bids_staging=""',
+        'if [[ ! -d "$bids_source" ]]; then',
+        '  echo "BIDS input directory not found: $bids_source" >&2',
+        "  exit 1",
         "fi",
-        f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {archived_bids}')}",
+        'mkdir -p "$cohort" "$cohort_archive" "$preprocess"',
+        f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {bids_dir}')}",
     ]
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.append('mkdir -p "$confound"')
@@ -1346,7 +1338,7 @@ class _LegacySubjectManager(QMainWindow):
         self.session_details.setHorizontalHeaderLabels([
             "Session",
             "NIfTI orientations",
-            "Session input",
+            "Input source",
             "Subject preprocess",
             "Subject confound",
             "Subject analysis",
@@ -1536,18 +1528,25 @@ class _LegacySubjectManager(QMainWindow):
         ]
         if not rows:
             rows = [(session, None, "No NIfTI files found") for session in sessions]
+        cohort_mode = self.mode_selector.currentData() == "cohort"
         self.session_details.setRowCount(len(rows))
         for row, (session, path, orientation) in enumerate(rows):
             archive = (
-                "Not applicable"
-                if session == "No session"
+                "Original BIDS"
+                if cohort_mode
                 else (
-                    "Available"
-                    if (
-                        results / "cohort" / "input_bids"
-                        / subject / session
-                    ).is_dir()
-                    else "Not found"
+                    "Not applicable"
+                    if session == "No session"
+                    else (
+                        "Available"
+                        if (
+                            results
+                            / subject
+                            / _gui_core._session_result_name(session)
+                            / "input_bids"
+                        ).is_dir()
+                        else "Not found"
+                    )
                 )
             )
             values = (
@@ -1823,17 +1822,6 @@ class _LegacySubjectManager(QMainWindow):
                 "Select an existing original BIDS folder before reorienting files.",
             )
             return
-        _, _, results, _, _ = self._project_paths()
-        if (results / "cohort" / "input_bids").is_dir():
-            QMessageBox.critical(
-                self,
-                "Clear cohort results before reorienting",
-                "This cohort already has an archived BIDS snapshot. Clear ALL results "
-                "before changing the input orientations, then reorient and create a "
-                "new cohort script.",
-            )
-            return
-
         candidates = []
         unreadable = []
         try:
@@ -1989,9 +1977,7 @@ class _LegacySubjectManager(QMainWindow):
             return
         pipeline = self.pipeline_selector.currentData()
         pipeline_label = self.pipeline_selector.currentText()
-        orientation_source = results / "cohort" / "input_bids"
-        if not orientation_source.is_dir():
-            orientation_source = bids_dir
+        orientation_source = bids_dir
         subject_prefix = self.path_fields["subject_prefix"].text().strip()
         try:
             subjects = [
@@ -2041,6 +2027,12 @@ class _LegacySubjectManager(QMainWindow):
         expected_bids_source = (
             f"bids_source={shlex.quote(str(bids_dir.expanduser().resolve()))}"
         )
+        expected_bids_bind = (
+            "-B "
+            + shlex.quote(
+                f"{bids_dir.expanduser().resolve()}:/input_bids:ro"
+            )
+        )
         expected_cohort_dir = (
             f"cohort={shlex.quote(str((output / 'cohort').expanduser().resolve()))}"
         )
@@ -2049,14 +2041,15 @@ class _LegacySubjectManager(QMainWindow):
         )
         if (
             expected_bids_source not in script_text
+            or expected_bids_bind not in script_text
             or expected_cohort_dir not in script_text
             or expected_archive_dir not in script_text
         ):
             QMessageBox.critical(
                 self,
                 "Cohort script is out of date",
-                "The script was created for a different BIDS folder. "
-                "Create the cohort script again before submitting.",
+                "The script is outdated or was created for a different BIDS folder. "
+                "Create it again before submitting.",
             )
             return
         confirmation = QMessageBox.question(
@@ -2064,8 +2057,8 @@ class _LegacySubjectManager(QMainWindow):
             "Submit cohort job",
             f"Submit one {pipeline_label.lower()} job for all "
             f"{len(subjects)} subject(s) in "
-            f"{bids_dir} with sbatch? The job archives the full BIDS dataset "
-            f"under {results / 'cohort' / 'input_bids'} before processing.",
+            f"{bids_dir} with sbatch? RABIES will read the original BIDS "
+            "directory read-only; stage results will be archived separately.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirmation != QMessageBox.StandardButton.Yes:
@@ -2114,7 +2107,7 @@ class SubjectManager(_gui_core.SubjectManager):
             [
                 "Session",
                 "NIfTI orientations",
-                "Session input",
+                "Input source",
                 "Cohort preprocess",
                 "Cohort confound",
                 "Cohort analysis",
@@ -2200,7 +2193,7 @@ class SubjectManager(_gui_core.SubjectManager):
                 [
                     "Session",
                     "NIfTI orientations",
-                    "Session input",
+                    "Input source",
                     "Cohort preprocess",
                     "Cohort confound",
                     "Cohort analysis",
