@@ -7,10 +7,13 @@ orientations, and creating or submitting RABIES/FIXRABIES SLURM jobs:
   selected subjects. It creates preprocessing-only,
   preprocessing-plus-confound, full-pipeline, and preprocessing-plus-FIXRABIES
   prepare variants for each session, plus a FIXRABIES-prepare-only variant for
-  subjects whose preprocessing outputs already exist.
+  subjects whose preprocessing outputs already exist. It remains a standalone
+  entry point backed by the shared `rabies_gui_core.py` module.
 - `rabies_cohort_manager.py` provides the same subject/session tools and
   per-session job variants, plus one cohort-wide job for the full selected
-  BIDS dataset using RABIES' native subject/session handling.
+  BIDS dataset using RABIES' native subject/session handling. It also uses
+  `rabies_gui_core.py` directly rather than importing the subject-manager
+  entry point.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -164,9 +167,11 @@ discovers and pairs subject/session scans using its native BIDS handling.
 RABIES runs the selected preprocessing and analysis stages once across the
 dataset, including the configured group ICA for the full pipeline, instead of
 repeating them separately for each subject. The cohort input snapshot excludes
-`sub-*/ses-*/mrs/` directories. Results and workflow markers remain under
-`<results directory>/cohort/`, allowing a rerun of the script to skip completed
-stages and resume incomplete ones. Working stage outputs are under
+`sub-*/ses-*/mrs/` directories and skips the configured output and results
+folders if they are located inside the selected BIDS directory. Results and
+workflow markers remain under `<results directory>/cohort/`, allowing a rerun
+of the script to skip completed stages and resume incomplete ones. Working
+stage outputs are under
 `<output directory>/cohort/`; the delete-after-archive option removes these
 working copies only after they have been archived. Before the first stage, the
 job copies the selected BIDS tree once to

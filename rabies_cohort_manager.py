@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import rabies_subject_manager as _subject_manager
+import rabies_gui_core as _gui_core
 
 
 DEFAULT_RABIES_IMAGE = ""
@@ -236,7 +236,7 @@ def clear_results(results_dir: Path, subjects: list[str] | None = None) -> int:
 
 
 def output_subject_names(output_dir: Path) -> set[str]:
-    output_dir = output_dir / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
+    output_dir = output_dir / _gui_core.SINGLE_SUBJECT_OUTPUT_DIR
     if output_dir.is_symlink():
         return set()
     subject_dirs = ("tmp_bids", "func_preprocess", "func_confound", "func_analysis")
@@ -263,7 +263,7 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
     ):
         raise ValueError(f"Refusing to remove contents of protected directory: {output_dir}")
     output_root = output_dir
-    output_dir = output_root / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
+    output_dir = output_root / _gui_core.SINGLE_SUBJECT_OUTPUT_DIR
     if output_dir.is_symlink():
         raise ValueError(
             f"Refusing to clear symlinked workflow output directory: {output_dir}"
@@ -305,7 +305,7 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
 
 def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str, bool]:
     """Report completed stages using RABIES' post-run workflow pickle files."""
-    output_dir = output_dir / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
+    output_dir = output_dir / _gui_core.SINGLE_SUBJECT_OUTPUT_DIR
     subject_output = output_dir / "func_preprocess" / subject
     confound_output = output_dir / "func_confound" / subject
     analysis_output = output_dir / "func_analysis" / subject
@@ -409,12 +409,12 @@ def discover_subjects(
         bold_count = sum(
             1
             for path in subject_dir.rglob("*_bold.nii.gz")
-            if not _subject_manager._is_mrs_path(path, subject_dir)
+            if not _gui_core._is_mrs_path(path, subject_dir)
         )
         anat_count = sum(
             1
             for path in subject_dir.rglob("*_T2w.nii.gz")
-            if not _subject_manager._is_mrs_path(path, subject_dir)
+            if not _gui_core._is_mrs_path(path, subject_dir)
         )
         subjects.append((subject_dir.name, bold_count, anat_count))
     return subjects
@@ -441,7 +441,7 @@ def session_nifti_orientations(
     for path in sorted(subject_dir.rglob("*")):
         if (
             not path.is_file()
-            or _subject_manager._is_mrs_path(path, subject_dir)
+            or _gui_core._is_mrs_path(path, subject_dir)
             or not (
                 path.name.endswith(".nii") or path.name.endswith(".nii.gz")
             )
@@ -658,15 +658,16 @@ def generate_cohort_script(
 ) -> str:
     """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
-    cohort_archive = (results_dir / "cohort").expanduser().resolve()
+    results_dir = results_dir.expanduser().resolve()
+    cohort_archive = results_dir / "cohort"
     output_root = (
         output_dir.expanduser().resolve()
         if output_dir is not None
-        else (results_dir.parent / "rabies_outputs").resolve()
+        else results_dir.parent / "rabies_outputs"
     )
     cohort_output = output_root / "cohort"
     if any(
-        bids_dir == path or bids_dir in path.parents or path in bids_dir.parents
+        bids_dir == path or path in bids_dir.parents
         for path in (cohort_archive, cohort_output)
     ):
         raise ValueError(
@@ -680,6 +681,19 @@ def generate_cohort_script(
         raise ValueError(
             "Cohort working outputs and archived results must be separate directories."
         )
+    source_exclusions = ["./*/ses-*/mrs"]
+    for directory in (output_root, results_dir):
+        try:
+            relative_directory = directory.relative_to(bids_dir)
+        except ValueError:
+            continue
+        if not relative_directory.parts:
+            raise ValueError(
+                "The output and results directories must not be the BIDS source directory."
+            )
+        exclusion = f"./{relative_directory.as_posix()}"
+        if exclusion not in source_exclusions:
+            source_exclusions.append(exclusion)
     subjects = discover_subjects(bids_dir, subject_prefix)
     if not subjects:
         raise ValueError(f"No BIDS subjects found in {bids_dir}.")
@@ -755,6 +769,13 @@ def generate_cohort_script(
     )
     analysis_workflow = _workflow_path(analysis, "analysis")
     archived_analysis_workflow = _workflow_path(analysis_archive, "analysis")
+    find_source_args = ["find", ".", "-type", "d", "("]
+    for index, exclusion in enumerate(source_exclusions):
+        if index:
+            find_source_args.append("-o")
+        find_source_args.extend(("-path", exclusion))
+    find_source_args.extend((")", "-prune", "-o", "-print0"))
+    find_source_command = _shell_command(find_source_args)
     lines = [
         "#!/usr/bin/env bash",
         "#SBATCH --time=48:00:00",
@@ -786,8 +807,8 @@ def generate_cohort_script(
         'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
         'if [[ ! -d "$archived_bids" ]]; then',
         '  bids_staging=$(mktemp -d "$cohort_archive/.input_bids.XXXXXX")',
-        '  (cd "$bids_source" && find . -type d -path "./*/ses-*/mrs" '
-        '-prune -o -print0) | tar --null -T - -cf - '
+        f'  (cd "$bids_source" && {find_source_command}) '
+        '| tar --null -T - -cf - '
         '| tar -C "$bids_staging" -xf -',
         '  mv "$bids_staging" "$archived_bids"',
         '  bids_staging=""',
@@ -910,7 +931,7 @@ def generate_subject_script(
     if not anat_files:
         raise ValueError(f"No *_T2w.nii.gz files found for {subject}.")
 
-    output_dir = output_dir / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
+    output_dir = output_dir / _gui_core.SINGLE_SUBJECT_OUTPUT_DIR
     bids = output_dir / "tmp_bids" / subject
     preprocess = output_dir / "func_preprocess" / subject
     confound = output_dir / "func_confound" / subject
@@ -2084,7 +2105,7 @@ class _LegacySubjectManager(QMainWindow):
         QMessageBox.information(self, "Jobs submitted", "\n".join(submitted))
 
 
-class SubjectManager(_subject_manager.SubjectManager):
+class SubjectManager(_gui_core.SubjectManager):
     def __init__(self, setup_window: ProjectSetupWindow) -> None:
         super().__init__(setup_window)
         self.setWindowTitle("RABIES Cohort Manager")
@@ -2311,7 +2332,7 @@ class SubjectManager(_subject_manager.SubjectManager):
                 self, current_row, current_column, previous_row, previous_column
             )
         else:
-            _subject_manager.SubjectManager._show_session_details(
+            _gui_core.SubjectManager._show_session_details(
                 self, current_row, current_column, previous_row, previous_column
             )
 
@@ -2353,10 +2374,10 @@ class SubjectManager(_subject_manager.SubjectManager):
         if self.mode_selector.currentData() == "cohort":
             _LegacySubjectManager._clear_results(self, subjects)
         else:
-            _subject_manager.SubjectManager._clear_results(self, subjects)
+            _gui_core.SubjectManager._clear_results(self, subjects)
 
 
-class ProjectSetupWindow(_subject_manager.ProjectSetupWindow):
+class ProjectSetupWindow(_gui_core.ProjectSetupWindow):
     def open_subject_manager(self) -> None:
         _LegacyProjectSetupWindow.open_subject_manager(self)
 
@@ -2365,7 +2386,7 @@ def main() -> None:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication([])
     configure_dark_mode(app)
-    splash_pixmap = QPixmap(str(_subject_manager.SPLASH_IMAGE))
+    splash_pixmap = QPixmap(str(_gui_core.SPLASH_IMAGE))
     splash: QSplashScreen | None = None
     if not splash_pixmap.isNull():
         splash_pixmap = splash_pixmap.scaled(
