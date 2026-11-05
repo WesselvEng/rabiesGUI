@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entry point for the standalone subject/session manager."""
+"""Compatibility launcher for the unified RABIES GUI."""
 
 from typing import Any
 
@@ -15,4 +15,4 @@ def __getattr__(name: str) -> Any:
 
 
 if __name__ == "__main__":
-    _gui_core.main_subject_manager()
+    _gui_core.main()

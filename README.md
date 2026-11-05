@@ -1,4 +1,4 @@
-# RABIES subject and cohort manager
+# RABIES analysis manager
 
 The unified PySide6 GUI provides subject/session and cohort-wide workflows for
 viewing BIDS subjects, checking NIfTI orientations, and creating or submitting
@@ -6,15 +6,9 @@ RABIES/FIXRABIES SLURM jobs:
 
 - `rabies_gui_core.py` opens the unified GUI. Choose single-subject/session
   jobs or cohort-wide jobs from the **Analysis mode** dropdown.
-- `rabies_subject_manager.py` remains a compatibility entry point for the
-  standalone subject/session GUI, creating one independent job per BIDS session
-  for selected subjects. It supports preprocessing-only,
-  preprocessing-plus-confound, full-pipeline, and preprocessing-plus-FIXRABIES
-  prepare variants for each session, plus a FIXRABIES-prepare-only variant for
-  subjects whose preprocessing outputs already exist.
-- `rabies_cohort_manager.py` is also available as an entry point for the
-  unified GUI, including one cohort-wide job for the full selected BIDS
-  dataset using RABIES' native subject/session handling.
+- `rabies_subject_manager.py` and `rabies_cohort_manager.py` remain as
+  compatibility launchers. Both now start the same unified GUI and are not
+  required by `rabies_gui_core.py`.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -22,18 +16,14 @@ system must also have `sbatch` available. For example:
 
 ```sh
 python -m pip install -r rabies_gui_requirements.txt
-# Unified GUI with the analysis-mode dropdown
+# Unified GUI with single-subject/session and cohort modes
 python rabies_gui_core.py
-# One job per BIDS session for selected subjects
-python rabies_subject_manager.py
-# Unified GUI, also available through this entry point
-python rabies_cohort_manager.py
 ```
 
-Both managers use the same project setup and stage arguments. Their generated
-scripts, workflow outputs, and archived stage results use separate paths;
-both modes use the shared `cleaned_timeseries` folder when files are moved
-there.
+The **Analysis mode** dropdown selects per-session jobs or one cohort-wide job
+for the selected BIDS dataset. Generated scripts, workflow outputs, and
+archived stage results use separate paths; both modes use the shared
+`cleaned_timeseries` folder when files are moved there.
 
 FIXRABIES scripts call the `fixrabies` command directly, so FIXRABIES and its
 required FSL/FIX dependencies must be available in the job's environment.
@@ -55,11 +45,11 @@ When launched from a terminal, the current working directory is used as the
 initial project root. If it contains a `bids/` folder with subject directories
 matching the selected subject prefix, that folder is selected as the original
 BIDS folder automatically.
-Both managers display `RABIES-RABIES.png` as a splash image while they start.
+The GUI displays `RABIES-RABIES.png` as a splash image while it starts.
 Keep the image beside the Python scripts; if it is missing or cannot be loaded,
 the GUI starts normally without a splash.
 
-The cohort manager's **Analysis mode** dropdown switches between
+The **Analysis mode** dropdown switches between
 **Single-subject/session scripts and batch jobs** and **Cohort script and batch
 job**. Only the controls for the selected mode are shown. The first mode
 creates a separate `scrip_<subject>_<session>.sh` for each selected session,
@@ -117,7 +107,7 @@ The prefix must not be empty or contain path separators.
 Choose the original BIDS folder from the dropdown, which lists direct
 subfolders of the project root containing folders matching the subject prefix,
 or use its **Browse…** button to select another BIDS folder. The BIDS folder
-does not have to be named `og_bids`. Select **Open subject manager** to move
+does not have to be named `og_bids`. Select **Open analysis manager** to move
 to the separate subject window. Use **Project setup…** there to return to the
 setup window and apply different paths.
 
@@ -146,7 +136,7 @@ RABIES stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. FIXRABIES status is based on prepared scan
 directories in the selected project's shared FIX folder for per-session jobs.
 The subject table also lists shared FIX folders assigned to each subject. The
-cohort manager's cohort-mode status line reports completion from
+cohort-mode status line reports completion from
 `<results directory>/cohort/`, including FIXRABIES scan data under
 `<results directory>/cohort/fixrabies/data/`.
 
