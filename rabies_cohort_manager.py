@@ -687,9 +687,11 @@ def generate_cohort_script(
     analysis_workflow = _workflow_path(analysis, "analysis")
     lines = [
         "#!/usr/bin/env bash",
-        "#SBATCH --time=24:00:00",
-        "#SBATCH --mem=16G",
-        "#SBATCH --cpus-per-task=8",
+        "#SBATCH --time=48:00:00",
+        "#SBATCH --nodes=1",
+        "#SBATCH --ntasks=1",
+        "#SBATCH --mem=64G",
+        "#SBATCH --cpus-per-task=32",
         "set -euo pipefail",
         f"cohort={shlex.quote(str(cohort_dir))}",
         f"preprocess={shlex.quote(str(preprocess))}",
