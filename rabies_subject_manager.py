@@ -1521,21 +1521,27 @@ class SubjectManager(QMainWindow):
         )
         layout.addWidget(self.session_details, 1)
 
-        options = QHBoxLayout()
+        common_options = QHBoxLayout()
         for label, callback in (
             ("Refresh subjects", self.refresh_subjects),
             ("Select all", self.select_all),
             ("Clear selection", self.clear_selection),
-            ("Remove selected scripts", self.remove_scripts),
             ("Move cleaned timeseries", self.move_selected_cleaned_timeseries),
+            ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
+            ("RABIES arguments…", self.edit_arguments),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
-            options.addWidget(button)
-        options.addStretch()
+            common_options.addWidget(button)
+        common_options.addStretch()
+        layout.addLayout(common_options)
+
+        self.single_subject_controls = QWidget()
+        single_subject_layout = QVBoxLayout(self.single_subject_controls)
+        single_subject_layout.setContentsMargins(0, 0, 0, 0)
+        options = QHBoxLayout()
         for label, callback in (
-            ("RABIES arguments…", self.edit_arguments),
-            ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
+            ("Remove selected scripts", self.remove_scripts),
             ("Submit scripts with sbatch", self.submit_scripts),
         ):
             button = QPushButton(label)
@@ -1573,6 +1579,7 @@ class SubjectManager(QMainWindow):
         create_scripts = QPushButton("Create script")
         create_scripts.clicked.connect(self.create_scripts)
         options.addWidget(create_scripts)
+        single_subject_layout.addLayout(options)
         self.delete_output_after_archive = QCheckBox(
             "Delete archived outputs from rabies_output"
         )
@@ -1582,12 +1589,10 @@ class SubjectManager(QMainWindow):
             "after it has been copied to rabies_results. Uncheck to keep the "
             "complete workflow output."
         )
-        layout.addLayout(options)
-
         archive_options = QHBoxLayout()
         archive_options.addWidget(self.delete_output_after_archive)
         archive_options.addStretch()
-        layout.addLayout(archive_options)
+        single_subject_layout.addLayout(archive_options)
 
         fix_options = QHBoxLayout()
         fix_options.addWidget(QLabel("FIX species:"))
@@ -1596,7 +1601,7 @@ class SubjectManager(QMainWindow):
         fix_options.addWidget(self.fix_directory_selector)
         fix_options.addWidget(QLabel("New folder name:"))
         fix_options.addWidget(self.fix_directory_name, 1)
-        layout.addLayout(fix_options)
+        single_subject_layout.addLayout(fix_options)
 
         cleanup_options = QHBoxLayout()
         cleanup_options.addWidget(QLabel("Archived results (permanent deletion):"))
@@ -1617,7 +1622,8 @@ class SubjectManager(QMainWindow):
             button.clicked.connect(callback)
             cleanup_options.addWidget(button)
         cleanup_options.addStretch()
-        layout.addLayout(cleanup_options)
+        single_subject_layout.addLayout(cleanup_options)
+        layout.addWidget(self.single_subject_controls)
 
         self.status = QLabel(
             "Create or submit independent pipeline jobs for selected subject sessions."

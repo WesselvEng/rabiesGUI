@@ -364,8 +364,16 @@ def discover_subjects(
     for subject_dir in sorted(bids_dir.iterdir()):
         if not subject_dir.is_dir() or not subject_dir.name.startswith(subject_prefix):
             continue
-        bold_count = sum(1 for _ in subject_dir.rglob("*_bold.nii.gz"))
-        anat_count = sum(1 for _ in subject_dir.rglob("*_T2w.nii.gz"))
+        bold_count = sum(
+            1
+            for path in subject_dir.rglob("*_bold.nii.gz")
+            if not _subject_manager._is_mrs_path(path, subject_dir)
+        )
+        anat_count = sum(
+            1
+            for path in subject_dir.rglob("*_T2w.nii.gz")
+            if not _subject_manager._is_mrs_path(path, subject_dir)
+        )
         subjects.append((subject_dir.name, bold_count, anat_count))
     return subjects
 
@@ -389,8 +397,12 @@ def session_nifti_orientations(
         if entry.is_dir() and entry.name.startswith("ses-")
     }
     for path in sorted(subject_dir.rglob("*")):
-        if not path.is_file() or not (
-            path.name.endswith(".nii") or path.name.endswith(".nii.gz")
+        if (
+            not path.is_file()
+            or _subject_manager._is_mrs_path(path, subject_dir)
+            or not (
+                path.name.endswith(".nii") or path.name.endswith(".nii.gz")
+            )
         ):
             continue
         relative = path.relative_to(subject_dir)
@@ -689,7 +701,9 @@ def generate_cohort_script(
         'mkdir -p "$cohort" "$preprocess"',
         'if [[ ! -d "$archived_bids" ]]; then',
         '  bids_staging=$(mktemp -d "$cohort/.input_bids.XXXXXX")',
-        '  cp -a "$bids_source/." "$bids_staging/"',
+        '  (cd "$bids_source" && find . -type d -path "./*/ses-*/mrs" '
+        '-prune -o -print0) | tar --null -T - -cf - '
+        '| tar -C "$bids_staging" -xf -',
         '  mv "$bids_staging" "$archived_bids"',
         "fi",
         f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {archived_bids}')}",
@@ -1945,7 +1959,7 @@ class SubjectManager(_subject_manager.SubjectManager):
     def _build_ui(self) -> None:
         super()._build_ui()
         self.status.setText(
-            "Create per-session jobs or one cohort-wide job for the selected BIDS folder."
+            "Choose whether to create per-session jobs or one cohort-wide job."
         )
         self.subjects.setHorizontalHeaderLabels(
             [
@@ -1973,11 +1987,27 @@ class SubjectManager(_subject_manager.SubjectManager):
         layout = self.centralWidget().layout()
         if layout is None:
             raise RuntimeError("The subject manager central widget has no layout.")
-        self.cohort_stage_label = QLabel()
-        layout.insertWidget(1, self.cohort_stage_label)
 
+        mode_options = QHBoxLayout()
+        mode_options.addWidget(QLabel("Analysis mode:"))
+        self.mode_selector = QComboBox()
+        self.mode_selector.addItem(
+            "Single-subject/session scripts and batch jobs", "single_subject"
+        )
+        self.mode_selector.addItem("Cohort script and batch job", "cohort")
+        self.mode_selector.setCurrentIndex(1)
+        mode_options.addWidget(self.mode_selector)
+        mode_options.addStretch()
+        layout.insertLayout(1, mode_options)
+
+        self.cohort_stage_label = QLabel()
+        layout.insertWidget(2, self.cohort_stage_label)
+
+        self.cohort_controls = QWidget()
+        cohort_controls_layout = QVBoxLayout(self.cohort_controls)
+        cohort_controls_layout.setContentsMargins(0, 0, 0, 0)
         cohort_options = QHBoxLayout()
-        cohort_options.addWidget(QLabel("Cohort-wide job:"))
+        cohort_options.addWidget(QLabel("Cohort pipeline:"))
         self.cohort_pipeline_selector = QComboBox()
         for label, pipeline in PIPELINE_VARIANTS:
             self.cohort_pipeline_selector.addItem(label, pipeline)
@@ -2003,11 +2033,71 @@ class SubjectManager(_subject_manager.SubjectManager):
             button = QPushButton(label)
             button.clicked.connect(callback)
             cohort_options.addWidget(button)
-        layout.addLayout(cohort_options)
+        cohort_controls_layout.addLayout(cohort_options)
+
+        cohort_cleanup = QHBoxLayout()
+        cohort_cleanup.addWidget(QLabel("Cohort cleanup:"))
+        for label, callback in (
+            ("Clear ALL results", self.clear_all_results),
+            ("Clear ALL subject output", self.clear_all_output),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            cohort_cleanup.addWidget(button)
+        cohort_cleanup.addStretch()
+        cohort_controls_layout.addLayout(cohort_cleanup)
+        layout.insertWidget(layout.indexOf(self.status), self.cohort_controls)
+
+        self.mode_selector.currentIndexChanged.connect(
+            self._update_mode_controls
+        )
+        self._update_mode_controls()
+
+    def _update_mode_controls(self, _index: int = -1) -> None:
+        cohort_mode = self.mode_selector.currentData() == "cohort"
+        self.single_subject_controls.setVisible(not cohort_mode)
+        self.cohort_controls.setVisible(cohort_mode)
+        self.cohort_stage_label.setVisible(cohort_mode)
+        if cohort_mode:
+            self.session_details.setHorizontalHeaderLabels(
+                [
+                    "Session",
+                    "NIfTI orientations",
+                    "Session input",
+                    "Cohort preprocess",
+                    "Cohort confound",
+                    "Cohort analysis",
+                    "FIXRABIES prepare",
+                ]
+            )
+            self._refresh_cohort_status()
+        else:
+            self.session_details.setHorizontalHeaderLabels(
+                [
+                    "Session",
+                    "NIfTI orientations",
+                    "Session archive",
+                    "Session preprocess",
+                    "Session confound",
+                    "Session analysis",
+                    "Session FIXRABIES",
+                ]
+            )
+        current_row = self.subjects.currentRow()
+        if current_row >= 0:
+            self._show_session_details(
+                current_row, self.subjects.currentColumn(), -1, -1
+            )
+        self.status.setText(
+            "Create or submit one pipeline job for the full selected BIDS folder."
+            if cohort_mode
+            else "Create or submit independent jobs for selected subject sessions."
+        )
 
     def refresh_subjects(self) -> None:
         super().refresh_subjects()
-        self._refresh_cohort_status()
+        if self.mode_selector.currentData() == "cohort":
+            self._refresh_cohort_status()
 
     def _refresh_cohort_status(self) -> None:
         results_value = self.path_fields["results"].text().strip()
@@ -2040,9 +2130,14 @@ class SubjectManager(_subject_manager.SubjectManager):
         previous_row: int,
         previous_column: int,
     ) -> None:
-        _LegacySubjectManager._show_session_details(
-            self, current_row, current_column, previous_row, previous_column
-        )
+        if self.mode_selector.currentData() == "cohort":
+            _LegacySubjectManager._show_session_details(
+                self, current_row, current_column, previous_row, previous_column
+            )
+        else:
+            _subject_manager.SubjectManager._show_session_details(
+                self, current_row, current_column, previous_row, previous_column
+            )
 
     def _run_cohort_action(self, callback: Callable[[], None]) -> None:
         pipeline = self.cohort_pipeline_selector.currentData()
@@ -2079,7 +2174,10 @@ class SubjectManager(_subject_manager.SubjectManager):
         _LegacySubjectManager.remove_scripts(self)
 
     def _clear_results(self, subjects: list[str] | None) -> None:
-        _LegacySubjectManager._clear_results(self, subjects)
+        if self.mode_selector.currentData() == "cohort":
+            _LegacySubjectManager._clear_results(self, subjects)
+        else:
+            _subject_manager.SubjectManager._clear_results(self, subjects)
 
 
 class ProjectSetupWindow(_subject_manager.ProjectSetupWindow):

@@ -50,12 +50,13 @@ Both managers display `RABIES-RABIES.png` as a splash image while they start.
 Keep the image beside the Python scripts; if it is missing or cannot be loaded,
 the GUI starts normally without a splash.
 
-The cohort-wide manager,
-`rabies_cohort_manager.py`, includes the subject/session controls described
-below as well as separate cohort-wide script controls. For independent
-per-session jobs, create/submit scripts for the selected subjects. It creates a
-separate `scrip_<subject>_<session>.sh` for each session for the pipeline
-selected in the dropdown next to **Create script**.
+The cohort manager's **Analysis mode** dropdown switches between
+**Single-subject/session scripts and batch jobs** and **Cohort script and batch
+job**. Only the controls for the selected mode are shown. The first mode
+creates a separate `scrip_<subject>_<session>.sh` for each selected session,
+using the pipeline selected next to **Create script**. The cohort mode exposes
+the cohort pipeline, FIX species, and cohort script controls. Subject browsing
+and shared input tools remain available in either mode.
 Scripts are saved under
 `<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare,fixrabies_prepare_only}/`.
 Standard pipeline scripts stage only that session's BOLD/T2w files and write
@@ -108,13 +109,13 @@ setup window and apply different paths.
 The subject/session manager contains the subject table, per-session stage
 status, script controls, cleanup actions, and cleaned-timeseries tools. It
 shows BOLD and T2w scan counts and the status of preprocessing, confound
-correction, analysis, and FIXRABIES preparation. In the cohort manager, a
-separate status line reports cohort-wide stage completion.
-Select a subject to view its sessions, every NIfTI's orientation, whether the
-session input archive is present, and the applicable session or cohort stage
-results. NIfTI files under a session's `mrs/` directory are ignored by subject
-scan counts, orientation checks/reorientation, and RABIES session scripts;
-MRS data is not processed by RABIES. Script
+correction, analysis, and FIXRABIES preparation. In cohort mode, a separate
+status line reports cohort-wide stage completion.
+Select a subject to view its sessions, every RABIES-relevant NIfTI's
+orientation, whether the session input archive is present, and the applicable
+session or cohort stage results. Data under a session's `mrs/` directory is
+ignored by scan counts, orientation checks/reorientation, and both session and
+cohort RABIES inputs; MRS data is not processed by RABIES. Script
 creation is allowed regardless of orientation, but job submission is blocked
 if any BIDS NIfTI is unreadable or is not in RAS orientation. Orientation
 entries show a concise session/modality label; hover over an entry to see its
@@ -129,13 +130,14 @@ RABIES stage status is based on the corresponding
 `rabies_<stage>_workflow.pkl` file. FIXRABIES status is based on prepared scan
 directories in the selected project's shared FIX folder for per-session jobs.
 The subject table also lists shared FIX folders assigned to each subject. The
-cohort manager's separate cohort-wide status line reports completion from
+cohort manager's cohort-mode status line reports completion from
 `<results directory>/cohort/`, including FIXRABIES scan data under
 `<results directory>/cohort/fixrabies/data/`.
 
-Use the dropdown next to **Create script** for per-session jobs. For one
-cohort-wide job, choose a pipeline from the **Cohort-wide job** dropdown and
-select **Create cohort script**. Cohort scripts are saved under
+In **Single-subject/session** mode, use the pipeline dropdown next to **Create
+script** for per-session jobs. In **Cohort** mode, choose a pipeline from the
+**Cohort pipeline** dropdown and select **Create cohort script**. Cohort
+scripts are saved under
 `<output directory>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare}/`.
 Choose **Submit cohort with sbatch** to submit the selected cohort-wide
 variant as one job for every subject and session in the selected BIDS folder.
@@ -147,20 +149,23 @@ the whole RABIES pipeline (including analysis), or preprocessing followed by
 passed to the prepare command, which converts the RABIES preprocessing outputs
 into FIX-compatible scan directories under
 `<results directory>/cohort/fixrabies/data/`, then runs MELODIC and extracts
-FIX features. Each script preserves the complete BIDS tree in the cohort
-archive, then passes that archived BIDS root to RABIES, which discovers and
-pairs subject/session scans using its native BIDS handling. RABIES runs the
-selected preprocessing and analysis stages once across the dataset, including
-the configured group ICA for the full pipeline, instead of repeating them
-separately for each subject. Results and workflow markers remain under
+FIX features. Each script archives the RABIES-relevant BIDS tree, omitting
+session `mrs/` folders, then passes that archived BIDS root to RABIES, which
+discovers and pairs subject/session scans using its native BIDS handling.
+RABIES runs the selected preprocessing and analysis stages once across the
+dataset, including the configured group ICA for the full pipeline, instead of
+repeating them separately for each subject. The cohort input snapshot excludes
+`sub-*/ses-*/mrs/` directories. Results and workflow markers remain under
 `<results directory>/cohort/`, allowing a rerun of the script to skip completed
 stages and resume incomplete ones. The cohort script retains its stage outputs
 in this directory; the **Delete archived outputs from rabies_output** checkbox
-applies only to subject/session scripts. Before the first stage, the job copies the
-selected BIDS tree once to `<results directory>/cohort/input_bids/`, preserving
-each `sub-*/ses-*` layout. RABIES then runs against that archived BIDS tree, so
-the exact inputs are retained with the cohort outputs and are not recopied per
-subject.
+applies only to subject/session scripts. Before the first stage, the job copies
+the selected BIDS tree once to `<results directory>/cohort/input_bids/`,
+preserving each `sub-*/ses-*` layout but omitting `mrs/` folders. RABIES then
+runs against that archived BIDS tree, so the inputs used by RABIES are retained
+with the cohort outputs and are not recopied per subject. An existing cohort
+input snapshot is reused; clear all results before creating a new cohort run
+if you need to replace a snapshot created before MRS exclusion was added.
 
 Use **Clear ALL results** to remove every item inside the results directory,
 including the shared cohort outputs and cleaned timeseries. Cohort stages share
@@ -179,9 +184,10 @@ arguments in RABIES CLI form without the stage name or input/output paths.
 Braced dictionary values are supported, for example
 `--scan_QC_thresholds '{DR:{Dice:[0.3]}}'`.
 
-**Remove cohort scripts** deletes generated scripts from the pipeline
-subfolders of `tmp_script/`; it does not delete processing outputs. Select a
-variant and use **Create script** to generate it again with the current arguments.
+In **Cohort** mode, **Remove cohort scripts** deletes generated scripts from the
+pipeline subfolders of `tmp_script/`; it does not delete processing outputs.
+Select a variant and use **Create cohort script** to generate it again with the
+current arguments.
 
 Select subjects and choose **Move cleaned timeseries** to move their
 `*_cleaned.nii.gz` files from the cohort confound-correction datasink into the
