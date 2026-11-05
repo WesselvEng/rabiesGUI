@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -2632,7 +2633,7 @@ class SubjectManager(QMainWindow):
         )
 
 
-if __name__ == "__main__":
+def main_subject_manager() -> None:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication([])
     configure_dark_mode(app)
@@ -2664,3 +2665,15 @@ if __name__ == "__main__":
     else:
         window.show()
     app.exec()
+
+
+def main() -> None:
+    if __name__ == "__main__":
+        sys.modules.setdefault("rabies_gui_core", sys.modules[__name__])
+    from rabies_cohort_manager import main as cohort_manager_main
+
+    cohort_manager_main()
+
+
+if __name__ == "__main__":
+    main()

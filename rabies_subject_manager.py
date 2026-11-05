@@ -15,4 +15,4 @@ def __getattr__(name: str) -> Any:
 
 
 if __name__ == "__main__":
-    _gui_core.main()
+    _gui_core.main_subject_manager()

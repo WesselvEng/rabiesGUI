@@ -1,19 +1,20 @@
-# RABIES subject and cohort managers
+# RABIES subject and cohort manager
 
-Two PySide6 GUIs are available for viewing BIDS subjects, checking NIfTI
-orientations, and creating or submitting RABIES/FIXRABIES SLURM jobs:
+The unified PySide6 GUI provides subject/session and cohort-wide workflows for
+viewing BIDS subjects, checking NIfTI orientations, and creating or submitting
+RABIES/FIXRABIES SLURM jobs:
 
-- `rabies_subject_manager.py` creates one independent job per BIDS session for
-  selected subjects. It creates preprocessing-only,
+- `rabies_gui_core.py` opens the unified GUI. Choose single-subject/session
+  jobs or cohort-wide jobs from the **Analysis mode** dropdown.
+- `rabies_subject_manager.py` remains a compatibility entry point for the
+  standalone subject/session GUI, creating one independent job per BIDS session
+  for selected subjects. It supports preprocessing-only,
   preprocessing-plus-confound, full-pipeline, and preprocessing-plus-FIXRABIES
   prepare variants for each session, plus a FIXRABIES-prepare-only variant for
-  subjects whose preprocessing outputs already exist. It remains a standalone
-  entry point backed by the shared `rabies_gui_core.py` module.
-- `rabies_cohort_manager.py` provides the same subject/session tools and
-  per-session job variants, plus one cohort-wide job for the full selected
-  BIDS dataset using RABIES' native subject/session handling. It also uses
-  `rabies_gui_core.py` directly rather than importing the subject-manager
-  entry point.
+  subjects whose preprocessing outputs already exist.
+- `rabies_cohort_manager.py` is also available as an entry point for the
+  unified GUI, including one cohort-wide job for the full selected BIDS
+  dataset using RABIES' native subject/session handling.
 
 Run the GUI in a Linux desktop or X11-forwarded session that can access the
 BIDS, output, and results directories. To submit jobs from the GUI, that
@@ -21,9 +22,11 @@ system must also have `sbatch` available. For example:
 
 ```sh
 python -m pip install -r rabies_gui_requirements.txt
+# Unified GUI with the analysis-mode dropdown
+python rabies_gui_core.py
 # One job per BIDS session for selected subjects
 python rabies_subject_manager.py
-# One cohort-wide job
+# Unified GUI, also available through this entry point
 python rabies_cohort_manager.py
 ```
 
