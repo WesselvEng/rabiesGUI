@@ -889,6 +889,35 @@ def _expand_template_paths(arguments: str, templates: dict[str, str]) -> str:
     return arguments
 
 
+def bids_snapshot_find_command(
+    bids_dir: Path, excluded_dirs: tuple[Path, ...]
+) -> str:
+    """Build a find command that omits MRS and configured output directories."""
+    bids_dir = bids_dir.expanduser().resolve()
+    exclusions = ["./*/ses-*/mrs"]
+    for directory in excluded_dirs:
+        directory = directory.expanduser().resolve()
+        try:
+            relative_directory = directory.relative_to(bids_dir)
+        except ValueError:
+            continue
+        if not relative_directory.parts:
+            raise ValueError(
+                "The output and results directories must not be the BIDS source directory."
+            )
+        exclusion = f"./{relative_directory.as_posix()}"
+        if exclusion not in exclusions:
+            exclusions.append(exclusion)
+
+    find_args = ["find", ".", "-type", "d", "("]
+    for index, exclusion in enumerate(exclusions):
+        if index:
+            find_args.append("-o")
+        find_args.extend(("-path", exclusion))
+    find_args.extend((")", "-prune", "-o", "-print0"))
+    return _shell_command(find_args)
+
+
 def _session_name(path: Path, subject: str) -> str | None:
     """Return a file's BIDS session when it is below the subject directory."""
     for parent in path.parents:

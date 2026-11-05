@@ -681,19 +681,9 @@ def generate_cohort_script(
         raise ValueError(
             "Cohort working outputs and archived results must be separate directories."
         )
-    source_exclusions = ["./*/ses-*/mrs"]
-    for directory in (output_root, results_dir):
-        try:
-            relative_directory = directory.relative_to(bids_dir)
-        except ValueError:
-            continue
-        if not relative_directory.parts:
-            raise ValueError(
-                "The output and results directories must not be the BIDS source directory."
-            )
-        exclusion = f"./{relative_directory.as_posix()}"
-        if exclusion not in source_exclusions:
-            source_exclusions.append(exclusion)
+    find_source_command = _gui_core.bids_snapshot_find_command(
+        bids_dir, (output_root, results_dir)
+    )
     subjects = discover_subjects(bids_dir, subject_prefix)
     if not subjects:
         raise ValueError(f"No BIDS subjects found in {bids_dir}.")
@@ -769,13 +759,6 @@ def generate_cohort_script(
     )
     analysis_workflow = _workflow_path(analysis, "analysis")
     archived_analysis_workflow = _workflow_path(analysis_archive, "analysis")
-    find_source_args = ["find", ".", "-type", "d", "("]
-    for index, exclusion in enumerate(source_exclusions):
-        if index:
-            find_source_args.append("-o")
-        find_source_args.extend(("-path", exclusion))
-    find_source_args.extend((")", "-prune", "-o", "-print0"))
-    find_source_command = _shell_command(find_source_args)
     lines = [
         "#!/usr/bin/env bash",
         "#SBATCH --time=48:00:00",
