@@ -236,6 +236,9 @@ def clear_results(results_dir: Path, subjects: list[str] | None = None) -> int:
 
 
 def output_subject_names(output_dir: Path) -> set[str]:
+    output_dir = output_dir / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
+    if output_dir.is_symlink():
+        return set()
     subject_dirs = ("tmp_bids", "func_preprocess", "func_confound", "func_analysis")
     return {
         entry.name
@@ -259,12 +262,18 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
         or project_root in output_dir.parents
     ):
         raise ValueError(f"Refusing to remove contents of protected directory: {output_dir}")
+    output_root = output_dir
+    output_dir = output_root / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
+    if output_dir.is_symlink():
+        raise ValueError(
+            f"Refusing to clear symlinked workflow output directory: {output_dir}"
+        )
     if not output_dir.is_dir():
         return 0
 
     subject_dirs = ("tmp_bids", "func_preprocess", "func_confound", "func_analysis")
     if subjects is None:
-        subject_names = output_subject_names(output_dir)
+        subject_names = output_subject_names(output_root)
     else:
         for subject in subjects:
             if not subject or Path(subject).name != subject or subject in {".", ".."}:
@@ -296,6 +305,7 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
 
 def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str, bool]:
     """Report completed stages using RABIES' post-run workflow pickle files."""
+    output_dir = output_dir / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
     subject_output = output_dir / "func_preprocess" / subject
     confound_output = output_dir / "func_confound" / subject
     analysis_output = output_dir / "func_analysis" / subject
@@ -322,18 +332,50 @@ def stage_status(subject: str, output_dir: Path, results_dir: Path) -> dict[str,
     }
 
 
-def cohort_stage_status(results_dir: Path) -> dict[str, bool]:
+def cohort_stage_status(
+    results_dir: Path, output_dir: Path | None = None
+) -> dict[str, bool]:
     """Report completion markers for cohort-wide RABIES and FIXRABIES stages."""
-    cohort_dir = results_dir / "cohort"
-    fix_data = cohort_dir / "fixrabies" / "data"
+    archive_dir = results_dir / "cohort"
+    work_dir = (output_dir or results_dir.parent / "rabies_outputs") / "cohort"
+
+    def stage_exists(name: str, stage: str) -> bool:
+        marker = f"rabies_{stage}_workflow.pkl"
+        return any(
+            (directory / name / marker).is_file()
+            for directory in (work_dir, archive_dir)
+        )
+
+    fix_data_dirs = (
+        work_dir / "fixrabies" / "data",
+        archive_dir / "fixrabies" / "data",
+    )
     return {
-        "preprocess": _workflow_path(cohort_dir / "preprocess", "preprocess").is_file(),
-        "confound": _workflow_path(
-            cohort_dir / "confound", "confound_correction"
-        ).is_file(),
-        "analysis": _workflow_path(cohort_dir / "analysis", "analysis").is_file(),
-        "fixrabies": fix_data.is_dir() and any(fix_data.iterdir()),
+        "preprocess": stage_exists("preprocess", "preprocess"),
+        "confound": stage_exists("confound", "confound_correction"),
+        "analysis": stage_exists("analysis", "analysis"),
+        "fixrabies": any(path.is_dir() and any(path.iterdir()) for path in fix_data_dirs),
     }
+
+
+def clear_cohort_output(output_dir: Path) -> int:
+    """Remove only cohort working output, preserving scripts and archived results."""
+    output_dir = output_dir.expanduser().resolve()
+    project_root = Path(__file__).resolve().parent
+    protected_paths = (Path.home().resolve(), project_root)
+    if (
+        any(output_dir == path or output_dir in path.parents for path in protected_paths)
+        or project_root in output_dir.parents
+    ):
+        raise ValueError(f"Refusing to remove contents of protected directory: {output_dir}")
+    target = output_dir / "cohort"
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+        return 1
+    if target.is_dir():
+        shutil.rmtree(target)
+        return 1
+    return 0
 
 
 def _validate_subject_prefix(subject_prefix: str) -> str:
@@ -611,13 +653,32 @@ def generate_cohort_script(
     pipeline: str = "whole_pipeline",
     fix_species: str = "ratSIGMA",
     subject_prefix: str = "sub-",
+    output_dir: Path | None = None,
+    delete_output_after_archive: bool = True,
 ) -> str:
     """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
-    cohort_dir = (results_dir / "cohort").expanduser().resolve()
-    if bids_dir == cohort_dir or bids_dir in cohort_dir.parents:
+    cohort_archive = (results_dir / "cohort").expanduser().resolve()
+    output_root = (
+        output_dir.expanduser().resolve()
+        if output_dir is not None
+        else (results_dir.parent / "rabies_outputs").resolve()
+    )
+    cohort_output = output_root / "cohort"
+    if any(
+        bids_dir == path or bids_dir in path.parents or path in bids_dir.parents
+        for path in (cohort_archive, cohort_output)
+    ):
         raise ValueError(
-            "The cohort results directory must not be inside the input BIDS directory."
+            "Cohort working and results directories must not overlap the input BIDS directory."
+        )
+    if (
+        cohort_output == cohort_archive
+        or cohort_output in cohort_archive.parents
+        or cohort_archive in cohort_output.parents
+    ):
+        raise ValueError(
+            "Cohort working outputs and archived results must be separate directories."
         )
     subjects = discover_subjects(bids_dir, subject_prefix)
     if not subjects:
@@ -627,11 +688,15 @@ def generate_cohort_script(
     if fix_species not in FIXRABIES_SPECIES:
         raise ValueError(f"Unsupported FIXRABIES species: {fix_species}")
 
-    preprocess = cohort_dir / "preprocess"
-    confound = cohort_dir / "confound"
-    analysis = cohort_dir / "analysis"
-    fix_dir = cohort_dir / "fixrabies"
-    archived_bids = cohort_dir / "input_bids"
+    preprocess = cohort_output / "preprocess"
+    confound = cohort_output / "confound"
+    analysis = cohort_output / "analysis"
+    fix_dir = cohort_output / "fixrabies"
+    archived_bids = cohort_archive / "input_bids"
+    preprocess_archive = cohort_archive / "preprocess"
+    confound_archive = cohort_archive / "confound"
+    analysis_archive = cohort_archive / "analysis"
+    fix_archive = cohort_archive / "fixrabies"
     templates = {
         "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
         "brain_mask": "/templates/anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
@@ -683,8 +748,13 @@ def generate_cohort_script(
     ]
 
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
+    archived_preprocess_workflow = _workflow_path(preprocess_archive, "preprocess")
     confound_workflow = _workflow_path(confound, "confound_correction")
+    archived_confound_workflow = _workflow_path(
+        confound_archive, "confound_correction"
+    )
     analysis_workflow = _workflow_path(analysis, "analysis")
+    archived_analysis_workflow = _workflow_path(analysis_archive, "analysis")
     lines = [
         "#!/usr/bin/env bash",
         "#SBATCH --time=48:00:00",
@@ -693,20 +763,34 @@ def generate_cohort_script(
         "#SBATCH --mem=64G",
         "#SBATCH --cpus-per-task=32",
         "set -euo pipefail",
-        f"cohort={shlex.quote(str(cohort_dir))}",
+        f"cohort={shlex.quote(str(cohort_output))}",
+        f"cohort_archive={shlex.quote(str(cohort_archive))}",
         f"preprocess={shlex.quote(str(preprocess))}",
+        f"preprocess_archive={shlex.quote(str(preprocess_archive))}",
         f"confound={shlex.quote(str(confound))}",
+        f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis={shlex.quote(str(analysis))}",
+        f"analysis_archive={shlex.quote(str(analysis_archive))}",
         f"fix_dir={shlex.quote(str(fix_dir))}",
+        f"fix_archive={shlex.quote(str(fix_archive))}",
         f"bids_source={shlex.quote(str(bids_dir))}",
         f"archived_bids={shlex.quote(str(archived_bids))}",
-        'mkdir -p "$cohort" "$preprocess"',
+        'for output_path in "$cohort" "$cohort_archive"; do',
+        '  if [[ -L "$output_path" ]]; then',
+        '    echo "Refusing to use symlinked cohort output path: $output_path" >&2',
+        "    exit 1",
+        "  fi",
+        "done",
+        'mkdir -p "$cohort" "$cohort_archive" "$preprocess"',
+        'bids_staging=""',
+        'trap \'if [[ -n "${bids_staging:-}" && -d "$bids_staging" ]]; then rm -rf -- "$bids_staging"; fi\' EXIT',
         'if [[ ! -d "$archived_bids" ]]; then',
-        '  bids_staging=$(mktemp -d "$cohort/.input_bids.XXXXXX")',
+        '  bids_staging=$(mktemp -d "$cohort_archive/.input_bids.XXXXXX")',
         '  (cd "$bids_source" && find . -type d -path "./*/ses-*/mrs" '
         '-prune -o -print0) | tar --null -T - -cf - '
         '| tar -C "$bids_staging" -xf -',
         '  mv "$bids_staging" "$archived_bids"',
+        '  bids_staging=""',
         "fi",
         f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {archived_bids}')}",
     ]
@@ -717,26 +801,53 @@ def generate_cohort_script(
     if pipeline == "fixrabies_prepare":
         lines.append('mkdir -p "$fix_dir"')
     lines.extend([
+        f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+        f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+        '  mkdir -p "$preprocess"',
+        '  cp -a "$preprocess_archive/." "$preprocess/"',
+        "fi",
         f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
         "  " + _shell_command(preprocess_command),
         "fi",
+        'mkdir -p "$preprocess_archive"',
+        'cp -a "$preprocess/." "$preprocess_archive/"',
     ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.extend([
+            f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+            f"&& -f {shlex.quote(str(archived_confound_workflow))} ]]; then",
+            '  mkdir -p "$confound"',
+            '  cp -a "$confound_archive/." "$confound/"',
+            "fi",
             f"if [[ ! -f {shlex.quote(str(confound_workflow))} ]]; then",
             "  " + _shell_command(confound_command),
             "fi",
+            'mkdir -p "$confound_archive"',
+            'cp -a "$confound/." "$confound_archive/"',
         ])
     if pipeline == "whole_pipeline":
         lines.extend([
+            f"if [[ ! -f {shlex.quote(str(analysis_workflow))} "
+            f"&& -f {shlex.quote(str(archived_analysis_workflow))} ]]; then",
+            '  mkdir -p "$analysis"',
+            '  cp -a "$analysis_archive/." "$analysis/"',
+            "fi",
             f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
             "  " + _shell_command(analysis_command),
             "fi",
+            'mkdir -p "$analysis_archive"',
+            'cp -a "$analysis/." "$analysis_archive/"',
         ])
     if pipeline == "fixrabies_prepare":
         fix_data = fix_dir / "data"
         fix_marker = fix_dir / ".prepare_complete"
+        archived_fix_marker = fix_archive / ".prepare_complete"
         lines.extend([
+            f"if [[ ! -f {shlex.quote(str(fix_marker))} "
+            f"&& -f {shlex.quote(str(archived_fix_marker))} ]]; then",
+            '  mkdir -p "$fix_dir"',
+            '  cp -a "$fix_archive/." "$fix_dir/"',
+            "fi",
             f"if [[ -d {shlex.quote(str(fix_data))} "
             f"&& -n \"$(find {shlex.quote(str(fix_data))} -mindepth 1 "
             f"-maxdepth 1 -print -quit)\" "
@@ -752,11 +863,21 @@ def generate_cohort_script(
             "  " + _shell_command(fix_prepare_command),
             f"  touch {shlex.quote(str(fix_marker))}",
             "fi",
+            'mkdir -p "$fix_archive"',
+            'cp -a "$fix_dir/." "$fix_archive/"',
         ])
     lines.extend([
         f'echo "Finished cohort {pipeline.replace("_", " ")}"',
-        "",
     ])
+    if delete_output_after_archive:
+        lines.extend([
+            'if [[ -L "$cohort" ]]; then',
+            '  echo "Refusing to delete symlinked cohort working output: $cohort" >&2',
+            "  exit 1",
+            "fi",
+            'if [[ -d "$cohort" ]]; then rm -rf -- "$cohort"; fi',
+        ])
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -789,6 +910,7 @@ def generate_subject_script(
     if not anat_files:
         raise ValueError(f"No *_T2w.nii.gz files found for {subject}.")
 
+    output_dir = output_dir / _subject_manager.SINGLE_SUBJECT_OUTPUT_DIR
     bids = output_dir / "tmp_bids" / subject
     preprocess = output_dir / "func_preprocess" / subject
     confound = output_dir / "func_confound" / subject
@@ -1110,7 +1232,7 @@ class _LegacyProjectSetupWindow(QMainWindow):
         if not root_value:
             return
         root = Path(root_value).expanduser()
-        self.path_fields["output"].setText(str(root / "rabies_output"))
+        self.path_fields["output"].setText(str(root / "rabies_outputs"))
         self.path_fields["results"].setText(str(root / "rabies_results"))
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
@@ -1356,7 +1478,8 @@ class _LegacySubjectManager(QMainWindow):
         try:
             self.subjects.setRowCount(len(discovered))
             for row, (subject, bold_count, anat_count) in enumerate(discovered):
-                states = cohort_stage_status(results)
+                _, output, _, _, _ = self._project_paths()
+                states = cohort_stage_status(results, output)
                 previous_results = subject_has_previous_results(subject, results)
                 values = (
                     subject,
@@ -1393,7 +1516,7 @@ class _LegacySubjectManager(QMainWindow):
             return
 
         subject = subject_item.text()
-        _, _, results, _, _ = self._project_paths()
+        _, output, results, _, _ = self._project_paths()
         try:
             sessions = session_nifti_orientations(bids_dir / subject)
         except OSError as error:
@@ -1401,7 +1524,7 @@ class _LegacySubjectManager(QMainWindow):
             return
         if not sessions:
             sessions = {"No session": []}
-        states = cohort_stage_status(results)
+        states = cohort_stage_status(results, output)
         rows = [
             (session, path, orientation)
             for session, files in sessions.items()
@@ -1823,6 +1946,10 @@ class _LegacySubjectManager(QMainWindow):
                 pipeline=pipeline,
                 fix_species=self.fix_species_selector.currentText(),
                 subject_prefix=subject_prefix,
+                output_dir=output,
+                delete_output_after_archive=(
+                    self.delete_output_after_archive.isChecked()
+                ),
             )
             script_path = script_root / pipeline / "scrip_cohort.sh"
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1911,11 +2038,15 @@ class _LegacySubjectManager(QMainWindow):
             f"bids_source={shlex.quote(str(bids_dir.expanduser().resolve()))}"
         )
         expected_cohort_dir = (
-            f"cohort={shlex.quote(str((results / 'cohort').expanduser().resolve()))}"
+            f"cohort={shlex.quote(str((output / 'cohort').expanduser().resolve()))}"
+        )
+        expected_archive_dir = (
+            f"cohort_archive={shlex.quote(str((results / 'cohort').expanduser().resolve()))}"
         )
         if (
             expected_bids_source not in script_text
             or expected_cohort_dir not in script_text
+            or expected_archive_dir not in script_text
         ):
             QMessageBox.critical(
                 self,
@@ -2041,7 +2172,7 @@ class SubjectManager(_subject_manager.SubjectManager):
         cohort_cleanup.addWidget(QLabel("Cohort cleanup:"))
         for label, callback in (
             ("Clear ALL results", self.clear_all_results),
-            ("Clear ALL subject output", self.clear_all_output),
+            ("Clear cohort output", self.clear_cohort_outputs),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
@@ -2102,12 +2233,18 @@ class SubjectManager(_subject_manager.SubjectManager):
             self._refresh_cohort_status()
 
     def _refresh_cohort_status(self) -> None:
+        output_value = self.path_fields["output"].text().strip()
         results_value = self.path_fields["results"].text().strip()
-        if not results_value:
-            self.cohort_stage_label.setText("Cohort-wide stages: results directory not set.")
+        if not output_value or not results_value:
+            self.cohort_stage_label.setText(
+                "Cohort-wide stages: output or results directory not set."
+            )
             return
         try:
-            states = cohort_stage_status(Path(results_value).expanduser())
+            states = cohort_stage_status(
+                Path(results_value).expanduser(),
+                Path(output_value).expanduser(),
+            )
         except OSError as error:
             QMessageBox.critical(
                 self, "Could not read cohort stage status", str(error)
@@ -2124,6 +2261,43 @@ class SubjectManager(_subject_manager.SubjectManager):
             for label, key in labels
         )
         self.cohort_stage_label.setText(f"Cohort-wide stages: {status}")
+
+    def clear_cohort_outputs(self) -> None:
+        output_value = self.path_fields["output"].text().strip()
+        if not output_value:
+            QMessageBox.critical(
+                self, "Output directory not set",
+                "Choose a project root or set an output directory.",
+            )
+            return
+        output = Path(output_value).expanduser()
+        target = output / "cohort"
+        if not target.exists() and not target.is_symlink():
+            QMessageBox.information(
+                self, "No cohort working output",
+                f"No temporary cohort output was found in {target}.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear cohort working output",
+            f"Permanently delete temporary cohort output from {target}?\n"
+            "Archived results and generated scripts are not removed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed = clear_cohort_output(output)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, "Could not clear cohort working output", str(error)
+            )
+            return
+        self._refresh_cohort_status()
+        self.status.setText(
+            f"Removed {removed} cohort working output folder(s) from {target}."
+        )
 
     def _show_session_details(
         self,

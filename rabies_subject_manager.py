@@ -56,6 +56,7 @@ FIX_DIRECTORY_PREFIX = "fixrabies_"
 FIX_SUBJECTS_FILE = ".rabies_gui_subjects.txt"
 FIX_SPECIES_FILE = ".rabies_gui_species.txt"
 FIX_CREATE_NEW = "__create_new__"
+SINGLE_SUBJECT_OUTPUT_DIR = "single-subject"
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -490,6 +491,9 @@ def clear_session_results(
 
 
 def output_subject_names(output_dir: Path) -> set[str]:
+    output_dir = output_dir / SINGLE_SUBJECT_OUTPUT_DIR
+    if output_dir.is_symlink():
+        return set()
     subject_dirs = (
         "tmp_bids",
         "tmp_bids_session",
@@ -519,6 +523,12 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
         or project_root in output_dir.parents
     ):
         raise ValueError(f"Refusing to remove contents of protected directory: {output_dir}")
+    output_root = output_dir
+    output_dir = output_root / SINGLE_SUBJECT_OUTPUT_DIR
+    if output_dir.is_symlink():
+        raise ValueError(
+            f"Refusing to clear symlinked workflow output directory: {output_dir}"
+        )
     if not output_dir.is_dir():
         return 0
 
@@ -530,7 +540,7 @@ def clear_output_subjects(output_dir: Path, subjects: list[str] | None = None) -
         "func_analysis",
     )
     if subjects is None:
-        subject_names = output_subject_names(output_dir)
+        subject_names = output_subject_names(output_root)
     else:
         for subject in subjects:
             if not subject or Path(subject).name != subject or subject in {".", ".."}:
@@ -569,6 +579,7 @@ def stage_status(
     project_root: Path | None = None,
 ) -> dict[str, bool]:
     """Report completed RABIES stages and FIXRABIES prepared scan output."""
+    output_dir = output_dir / SINGLE_SUBJECT_OUTPUT_DIR
     subject_output = output_dir / "func_preprocess" / subject
     confound_output = output_dir / "func_confound" / subject
     analysis_output = output_dir / "func_analysis" / subject
@@ -952,6 +963,7 @@ def generate_subject_script(
     session_name = _session_result_name(
         selected_session if selected_session is not None else "No session"
     )
+    output_dir = output_dir / SINGLE_SUBJECT_OUTPUT_DIR
     bids = output_dir / "tmp_bids_session" / subject / session_name
     preprocess = output_dir / "func_preprocess" / subject / session_name
     confound = output_dir / "func_confound" / subject / session_name
@@ -1002,18 +1014,23 @@ def generate_subject_script(
         str(rabies_image), "-f", "-p", "MultiProc", "analysis",
         "/confound_correction_outputs/", "/analysis_outputs/",
     ] + shlex.split(_expand_template_paths(analysis_args, templates))
-    fix_prepare_command = None
+    fix_prepare_command: str | None = None
     fix_marker = None
     fix_scan_check = None
     if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         assert fix_dir is not None
-        fix_prepare_command = [
-            "fixrabies", "prepare",
-            "-preprocess_dir", str(preprocess),
-            "-fix_dir", str(fix_dir),
-            "-species", fix_species,
-            "-nipype", '{"plugin":"MultiProc","n_procs":4}',
-        ]
+        fix_prepare_command = " ".join([
+            "fixrabies",
+            "prepare",
+            "-preprocess_dir",
+            '"$preprocess"',
+            "-fix_dir",
+            shlex.quote(str(fix_dir)),
+            "-species",
+            shlex.quote(fix_species),
+            "-nipype",
+            shlex.quote('{"plugin":"MultiProc","n_procs":4}'),
+        ])
         fix_marker = fix_dir / ".rabies_gui_prepared" / f"{subject}_{session_name}.done"
         scan_prefix = (
             subject if session_name == "no-session"
@@ -1044,6 +1061,7 @@ def generate_subject_script(
         f"bids={shlex.quote(str(bids))}",
         f"bids_parent={shlex.quote(str(bids.parent))}",
         f"preprocess={shlex.quote(str(preprocess))}",
+        f"preprocess_output={shlex.quote(str(preprocess))}",
         f"confound={shlex.quote(str(confound))}",
         f"analysis={shlex.quote(str(analysis))}",
         *(
@@ -1096,9 +1114,23 @@ def generate_subject_script(
             "fi",
         ])
     if pipeline == "fixrabies_prepare_only":
+        archived_preprocess_workflow = _workflow_path(
+            preprocess_archive, "preprocess"
+        )
         lines.extend([
-            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
-            f'  echo "Preprocessing output is missing for $subject session $session_name: {preprocess_workflow}" >&2',
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+            f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+            f"  preprocess={shlex.quote(str(preprocess_archive))}",
+            "fi",
+            f"if [[ \"$preprocess\" != {shlex.quote(str(preprocess_archive))} ]]; then",
+            f"  mkdir -p {shlex.quote(str(preprocess_archive))}",
+            f"  cp -a \"$preprocess/\". {shlex.quote(str(preprocess_archive))}/",
+            "fi",
+        ])
+    if pipeline == "fixrabies_prepare_only":
+        lines.extend([
+            'if [[ ! -f "$preprocess/rabies_preprocess_workflow.pkl" ]]; then',
+            '  echo "Preprocessing output is missing for $subject session $session_name: $preprocess" >&2',
             "  exit 1",
             "fi",
         ])
@@ -1111,11 +1143,8 @@ def generate_subject_script(
             f"if [[ -f {shlex.quote(str(preprocess_workflow))} ]]; then",
             f"  cp -f {shlex.quote(str(preprocess_workflow))} {shlex.quote(str(preprocess_archive))}/",
             "fi",
-            f"if [[ -f {shlex.quote(str(preprocess / 'rabies_preprocess.log'))} ]]; then",
-            f"  cp -f {shlex.quote(str(preprocess / 'rabies_preprocess.log'))} {shlex.quote(str(preprocess_archive))}/",
-            "fi",
-            f"if [[ -d {shlex.quote(str(preprocess / 'preprocess_QC_report'))} && ! -d {shlex.quote(str(preprocess_archive / 'preprocess_QC_report'))} ]]; then",
-            f"  cp -a {shlex.quote(str(preprocess / 'preprocess_QC_report'))} {shlex.quote(str(preprocess_archive))}/",
+            f"if [[ -d {shlex.quote(str(preprocess))} ]]; then",
+            f"  cp -a {shlex.quote(str(preprocess))}/. {shlex.quote(str(preprocess_archive))}/",
             "fi",
         ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
@@ -1128,10 +1157,7 @@ def generate_subject_script(
             f"    {_shell_command(confound_command)}",
             "  fi",
             f"  mkdir -p {shlex.quote(str(confound_archive))}",
-            f"  cp -a {shlex.quote(str(confound / 'confound_correction_datasink'))} {shlex.quote(str(confound_archive))}/",
-            f"  cp -f {shlex.quote(str(confound_workflow))} {shlex.quote(str(confound_archive))}/",
-            f"  cp -f {shlex.quote(str(confound_cli))} {shlex.quote(str(confound_archive))}/",
-            f"  cp -f {shlex.quote(str(confound / 'rabies_confound_correction.log'))} {shlex.quote(str(confound_archive))}/",
+            f"  cp -a {shlex.quote(str(confound))}/. {shlex.quote(str(confound_archive))}/",
             "fi",
         ])
     if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
@@ -1157,7 +1183,7 @@ def generate_subject_script(
             '        echo "FIXRABIES data for this subject/session already exists without a completion marker; inspect the scan output before retrying." >&2',
             "        exit 1",
             "      fi",
-            f"      {_shell_command(fix_prepare_command)}",
+            f"      {fix_prepare_command}",
             f"      touch {shlex.quote(str(fix_marker))}",
             "    fi",
             f"  ) 9>{shlex.quote(str(fix_dir / '.rabies_gui_prepare.lock'))}",
@@ -1181,22 +1207,22 @@ def generate_subject_script(
             "  fi",
             f"  mkdir -p {shlex.quote(str(analysis_archive))}",
             f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
-            *(
-                ['  find "$analysis" -mindepth 1 -delete']
-                if delete_output_after_archive
-                else []
-            ),
             "fi",
         ])
-    if pipeline in {"preproc_confound", "whole_pipeline"}:
-        if delete_output_after_archive:
-            lines.append(
-                'if [[ -d "$confound" ]]; then find "$confound" -mindepth 1 -delete; fi'
-            )
     if pipeline != "fixrabies_prepare_only":
         lines.extend([
             'mkdir -p "$session_archive"',
             'cp -a "$bids/." "$session_archive/"',
+        ])
+    if delete_output_after_archive:
+        lines.extend([
+            'for rabies_output in "$bids" "$preprocess_output" "$confound" "$analysis"; do',
+            '  if [[ -L "$rabies_output" ]]; then',
+            '    echo "Refusing to delete symlinked RABIES output: $rabies_output" >&2',
+            "    exit 1",
+            "  fi",
+            '  if [[ -d "$rabies_output" ]]; then rm -rf -- "$rabies_output"; fi',
+            "done",
         ])
     lines.extend(['echo "Finished subject $subject"', ""])
     return "\n".join(lines)
@@ -1386,7 +1412,7 @@ class ProjectSetupWindow(QMainWindow):
         if not root_value:
             return
         root = Path(root_value).expanduser()
-        self.path_fields["output"].setText(str(root / "rabies_output"))
+        self.path_fields["output"].setText(str(root / "rabies_outputs"))
         self.path_fields["results"].setText(str(root / "rabies_results"))
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
@@ -1536,6 +1562,21 @@ class SubjectManager(QMainWindow):
         common_options.addStretch()
         layout.addLayout(common_options)
 
+        self.delete_output_after_archive = QCheckBox(
+            "Delete RABIES working outputs after archiving to rabies_results"
+        )
+        self.delete_output_after_archive.setChecked(True)
+        self.delete_output_after_archive.setToolTip(
+            "After a job archives its results, remove its working folders from "
+            "rabies_outputs/single-subject or rabies_outputs/cohort. Archived "
+            "results in rabies_results are kept. Uncheck to retain working "
+            "folders; remove them later with the workflow output cleanup buttons."
+        )
+        output_retention_options = QHBoxLayout()
+        output_retention_options.addWidget(self.delete_output_after_archive)
+        output_retention_options.addStretch()
+        layout.addLayout(output_retention_options)
+
         self.single_subject_controls = QWidget()
         single_subject_layout = QVBoxLayout(self.single_subject_controls)
         single_subject_layout.setContentsMargins(0, 0, 0, 0)
@@ -1580,20 +1621,6 @@ class SubjectManager(QMainWindow):
         create_scripts.clicked.connect(self.create_scripts)
         options.addWidget(create_scripts)
         single_subject_layout.addLayout(options)
-        self.delete_output_after_archive = QCheckBox(
-            "Delete archived outputs from rabies_output"
-        )
-        self.delete_output_after_archive.setChecked(True)
-        self.delete_output_after_archive.setToolTip(
-            "Remove archived analysis and confound output from rabies_output "
-            "after it has been copied to rabies_results. Uncheck to keep the "
-            "complete workflow output."
-        )
-        archive_options = QHBoxLayout()
-        archive_options.addWidget(self.delete_output_after_archive)
-        archive_options.addStretch()
-        single_subject_layout.addLayout(archive_options)
-
         fix_options = QHBoxLayout()
         fix_options.addWidget(QLabel("FIX species:"))
         fix_options.addWidget(self.fix_species_selector)
@@ -2304,16 +2331,22 @@ class SubjectManager(QMainWindow):
                 ).items():
                     session_name = _session_result_name(session)
                     if pipeline == "fixrabies_prepare_only":
-                        preprocess_dir = (
-                            output / "func_preprocess" / subject / session_name
+                        preprocess_workflows = (
+                            _workflow_path(
+                                output / SINGLE_SUBJECT_OUTPUT_DIR
+                                / "func_preprocess" / subject / session_name,
+                                "preprocess",
+                            ),
+                            _workflow_path(
+                                results / subject / session_name / "preprocess",
+                                "preprocess",
+                            ),
                         )
-                        preprocess_workflow = _workflow_path(
-                            preprocess_dir, "preprocess"
-                        )
-                        if not preprocess_workflow.is_file():
+                        if not any(path.is_file() for path in preprocess_workflows):
                             raise ValueError(
                                 f"Preprocessing output is missing for "
-                                f"{subject}/{session}: {preprocess_workflow}. "
+                                f"{subject}/{session}. Checked: "
+                                f"{', '.join(str(path) for path in preprocess_workflows)}. "
                                 "Run preprocessing first."
                             )
                     script = generate_subject_script(

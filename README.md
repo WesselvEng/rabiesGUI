@@ -40,8 +40,11 @@ RABIES preprocessing; adjust the RABIES arguments when using a non-rat space.
 The GUI opens in the **RABIES Project Setup** window. Browse to the project
 root, output directory, results directory, RABIES image, and template folder
 (rat, mouse, or custom). Choosing a project root fills the output and results
-paths with `<project root>/rabies_output/` and
+paths with `<project root>/rabies_outputs/` and
 `<project root>/rabies_results/`; edit those fields afterward if needed.
+Existing output folders and generated scripts are not moved automatically;
+regenerate scripts to use the new `rabies_outputs/single-subject` and
+`rabies_outputs/cohort` working directories.
 When launched from a terminal, the current working directory is used as the
 initial project root. If it contains a `bids/` folder with subject directories
 matching the selected subject prefix, that folder is selected as the original
@@ -60,7 +63,8 @@ and shared input tools remain available in either mode.
 Scripts are saved under
 `<output>/tmp_script/{preproc_only,preproc_confound,whole_pipeline,fixrabies_prepare,fixrabies_prepare_only}/`.
 Standard pipeline scripts stage only that session's BOLD/T2w files and write
-stage outputs under `<output>/func_<stage>/<subject>/<session>/` and archived
+stage outputs under
+`<output>/single-subject/func_<stage>/<subject>/<session>/` and archived
 results under
 `<results>/<subject>/<session>/`. The FIXRABIES-prepare-only variant skips BIDS
 staging and uses the existing preprocessing outputs. For FIXRABIES, choose
@@ -75,10 +79,15 @@ assignments for scripts that have not yet run. Prepared scan data is stored
 under `<project root>/<FIX folder>/data/`. The generated jobs serialize FIX
 preparation with a shared lock, so they can be submitted together without
 running their FIX workflows concurrently against the same directory.
-The **Delete archived outputs from rabies_output** checkbox is enabled by
-default, preserving the existing behavior of clearing analysis and confound
-output from `rabies_output` after it has been copied to `rabies_results`.
-Uncheck it when creating scripts to retain the complete workflow output.
+Both GUIs provide a checked-by-default **Delete RABIES working outputs after
+archiving to rabies_results** option. For per-session jobs, it removes the
+session's staged BIDS input and preprocessing, confound, and analysis folders
+from `<output>/single-subject/` after archiving. For cohort jobs, it removes
+the working stage and FIXRABIES folders from `<output>/cohort/` after
+archiving. Archived results in `rabies_results` are never removed by this
+option. Uncheck it when creating scripts to retain working outputs; remove
+per-session output with **Clear selected output** or **Clear ALL subject
+output**, and cohort output with **Clear cohort output**.
 Choose **FIXRABIES prepare only** to create jobs that run only `fixrabies
 prepare` against existing per-session preprocessing outputs. The GUI checks
 that each selected subject/session has a preprocessing workflow before creating
@@ -148,7 +157,7 @@ the whole RABIES pipeline (including analysis), or preprocessing followed by
 `fixrabies prepare`. For FIXRABIES, the selected species/template space is
 passed to the prepare command, which converts the RABIES preprocessing outputs
 into FIX-compatible scan directories under
-`<results directory>/cohort/fixrabies/data/`, then runs MELODIC and extracts
+`<output directory>/cohort/fixrabies/data/`, then runs MELODIC and extracts
 FIX features. Each script archives the RABIES-relevant BIDS tree, omitting
 session `mrs/` folders, then passes that archived BIDS root to RABIES, which
 discovers and pairs subject/session scans using its native BIDS handling.
@@ -157,15 +166,16 @@ dataset, including the configured group ICA for the full pipeline, instead of
 repeating them separately for each subject. The cohort input snapshot excludes
 `sub-*/ses-*/mrs/` directories. Results and workflow markers remain under
 `<results directory>/cohort/`, allowing a rerun of the script to skip completed
-stages and resume incomplete ones. The cohort script retains its stage outputs
-in this directory; the **Delete archived outputs from rabies_output** checkbox
-applies only to subject/session scripts. Before the first stage, the job copies
-the selected BIDS tree once to `<results directory>/cohort/input_bids/`,
-preserving each `sub-*/ses-*` layout but omitting `mrs/` folders. RABIES then
-runs against that archived BIDS tree, so the inputs used by RABIES are retained
-with the cohort outputs and are not recopied per subject. An existing cohort
-input snapshot is reused; clear all results before creating a new cohort run
-if you need to replace a snapshot created before MRS exclusion was added.
+stages and resume incomplete ones. Working stage outputs are under
+`<output directory>/cohort/`; the delete-after-archive option removes these
+working copies only after they have been archived. Before the first stage, the
+job copies the selected BIDS tree once to
+`<results directory>/cohort/input_bids/`, preserving each `sub-*/ses-*` layout
+but omitting `mrs/` folders. RABIES then runs against that archived BIDS tree,
+so the inputs used by RABIES are retained with the cohort outputs and are not
+recopied per subject. An existing cohort input snapshot is reused; clear all
+results before creating a new cohort run if you need to replace a snapshot
+created before MRS exclusion was added.
 
 Use **Clear ALL results** to remove every item inside the results directory,
 including the shared cohort outputs and cleaned timeseries. Cohort stages share
