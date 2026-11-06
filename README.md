@@ -68,7 +68,9 @@ For cohort preprocessing, only
 working output is kept under `<output>/cohort/preprocess/` for analysis-only and
 FIX prepare-only workflows. Cohort confound archiving includes only
 `confound/confound_correction_datasink/cleaned_timeseries/`; analysis-only uses
-those cleaned files from the archive. Other completed cohort working stages are
+those cleaned files from the archive. Cohort analysis archiving includes only
+`analysis/commonspace_analysis_datasink/` and
+`analysis/data_diagnosis_datasink/`. Other completed cohort working stages are
 removed after archiving.
 
 **Submit scripts with sbatch** submits the currently selected pipeline. With no
@@ -91,9 +93,11 @@ subjects (or the full cohort) into the results directory without deleting the
 working copies. For cohorts, this archives only
 `preprocess/preprocess_QC_report/` from preprocessing and
 `confound/confound_correction_datasink/cleaned_timeseries/` from confound
-correction. Progress is shown in the GUI status and launch terminal. For SLURM
-jobs, archive-copy progress is written to the job's standard output/error log.
-Existing archived files with matching names may be replaced.
+correction, plus `analysis/commonspace_analysis_datasink/` and
+`analysis/data_diagnosis_datasink/` from analysis. Progress is shown in the GUI
+status and launch terminal. For SLURM jobs, archive-copy progress is written
+to the job's standard output/error log. Existing archived files with matching
+names may be replaced.
 **Clear ALL results** removes archived results after confirmation. The
 **Move cleaned timeseries** action moves `*_cleaned.nii.gz` files to
 `<results>/cleaned_timeseries/`; analysis-only reads the prior confound outputs

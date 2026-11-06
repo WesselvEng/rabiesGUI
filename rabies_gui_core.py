@@ -62,6 +62,10 @@ FIX_PIPELINE_VARIANTS = (
 PIPELINE_VARIANTS = NORMAL_PIPELINE_VARIANTS + FIX_PIPELINE_VARIANTS
 COHORT_PIPELINE_VARIANTS = PIPELINE_VARIANTS
 FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
+COHORT_ANALYSIS_ARCHIVE_DIRS = (
+    "commonspace_analysis_datasink",
+    "data_diagnosis_datasink",
+)
 FIX_DIRECTORY_PREFIX = "fixrabies_"
 FIX_SUBJECTS_FILE = ".rabies_gui_subjects.txt"
 FIX_SPECIES_FILE = ".rabies_gui_species.txt"
@@ -941,33 +945,68 @@ def discover_bids_folders(root_dir: Path, subject_prefix: str = "sub-") -> list[
     )
 
 
-def move_cleaned_timeseries(subjects: list[str], results_dir: Path) -> tuple[list[Path], list[Path]]:
+def move_cleaned_timeseries(
+    subjects: list[str],
+    results_dir: Path,
+    output_dir: Path | None = None,
+    cohort_mode: bool = False,
+) -> tuple[list[Path], list[Path]]:
     """Move selected subjects' cleaned NIfTI files into a shared results folder."""
     destination_dir = results_dir / "cleaned_timeseries"
     moved: list[Path] = []
     skipped: list[Path] = []
 
-    for subject in subjects:
-        subject_results = (
-            results_dir / SINGLE_SUBJECT_OUTPUT_DIR / "func_confound" / subject,
-            results_dir / subject,
+    if cohort_mode:
+        if output_dir is None:
+            raise ValueError("The output directory is required in cohort mode.")
+        cleaned_directories = (
+            output_dir
+            / "cohort"
+            / "confound"
+            / "confound_correction_datasink"
+            / "cleaned_timeseries",
+            results_dir
+            / "cohort"
+            / "confound"
+            / "confound_correction_datasink"
+            / "cleaned_timeseries",
         )
-        source_dirs = sorted(
-            path
-            for subject_root in subject_results
-            if subject_root.is_dir()
-            for path in subject_root.rglob("cleaned_timeseries")
-            if path.parent.name == "confound_correction_datasink"
+        selected_subjects = set(subjects)
+        source_files = sorted(
+            source
+            for cleaned_dir in cleaned_directories
+            if cleaned_dir.is_dir()
+            for source in cleaned_dir.rglob("*_cleaned.nii.gz")
+            if source.name.split("_", 1)[0] in selected_subjects
         )
-        for source_dir in source_dirs:
-            for source in sorted(source_dir.rglob("*_cleaned.nii.gz")):
-                destination = destination_dir / source.name
-                if destination.exists():
-                    skipped.append(source)
-                    continue
-                destination_dir.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(source), str(destination))
-                moved.append(destination)
+    else:
+        source_files = []
+        for subject in subjects:
+            subject_results = (
+                results_dir
+                / SINGLE_SUBJECT_OUTPUT_DIR
+                / "func_confound"
+                / subject,
+                results_dir / subject,
+            )
+            source_files.extend(
+                source
+                for subject_root in subject_results
+                if subject_root.is_dir()
+                for source_dir in subject_root.rglob("cleaned_timeseries")
+                if source_dir.parent.name == "confound_correction_datasink"
+                for source in source_dir.rglob("*_cleaned.nii.gz")
+            )
+        source_files.sort()
+
+    for source in source_files:
+        destination = destination_dir / source.name
+        if destination.exists():
+            skipped.append(source)
+            continue
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        moved.append(destination)
 
     return moved, skipped
 
@@ -1480,6 +1519,7 @@ def cohort_stage_status(
         work_dir / "confound" / "confound_correction_datasink" / "cleaned_timeseries",
         archive_dir / "confound" / "confound_correction_datasink" / "cleaned_timeseries",
     )
+    analysis_dirs = (work_dir / "analysis", archive_dir / "analysis")
     fix_data_dirs = (
         work_dir / "fixrabies" / "data",
         archive_dir / "fixrabies" / "data",
@@ -1491,7 +1531,13 @@ def cohort_stage_status(
             and any(directory.rglob("*_cleaned.nii.gz"))
             for directory in confound_dirs
         ),
-        "analysis": stage_exists("analysis", "analysis"),
+        "analysis": any(
+            all(
+                (directory / name).is_dir()
+                for name in COHORT_ANALYSIS_ARCHIVE_DIRS
+            )
+            for directory in analysis_dirs
+        ),
         "fixrabies": any(
             path.is_dir() and any(path.iterdir()) for path in fix_data_dirs
         ),
@@ -1707,6 +1753,42 @@ def archive_cohort_outputs(
                 raise ValueError(
                     f"Refusing to archive through a symlink: {destination}"
                 )
+        elif stage == "analysis":
+            copied_analysis = False
+            for directory_name in COHORT_ANALYSIS_ARCHIVE_DIRS:
+                analysis_source = source / directory_name
+                analysis_destination = destination / directory_name
+                if analysis_destination.is_symlink():
+                    raise ValueError(
+                        f"Refusing to archive through a symlink: "
+                        f"{analysis_destination}"
+                    )
+                copied_analysis = (
+                    _copy_archive_directory(
+                        analysis_source, analysis_destination, progress
+                    )
+                    or copied_analysis
+                )
+            if destination.is_dir():
+                for previous_archive in destination.iterdir():
+                    if previous_archive.name in COHORT_ANALYSIS_ARCHIVE_DIRS:
+                        continue
+                    if previous_archive.is_symlink() or previous_archive.is_file():
+                        previous_archive.unlink()
+                    elif previous_archive.is_dir():
+                        shutil.rmtree(previous_archive)
+                    logger.info(
+                        "Removed non-datasink cohort analysis archive: %s",
+                        previous_archive,
+                    )
+            if progress is not None:
+                progress(
+                    "Kept only commonspace_analysis_datasink and "
+                    "data_diagnosis_datasink in the cohort analysis archive"
+                )
+            if copied_analysis:
+                archived.append(destination)
+            continue
         copied = _copy_archive_directory(source, destination, progress)
         if stage in {"preprocess", "confound"}:
             allowed_root = (
@@ -2074,6 +2156,33 @@ def generate_cohort_script(
             "  exit 1",
             "fi",
         ])
+    analysis_archive_lines = [
+        'if [[ -L "$analysis_archive" '
+        + " || "
+        + " || ".join(
+            f'-L "$analysis/{name}" || -L "$analysis_archive/{name}"'
+            for name in COHORT_ANALYSIS_ARCHIVE_DIRS
+        )
+        + " ]]; then",
+        '  echo "Refusing to archive symlinked cohort analysis output." >&2',
+        "  exit 1",
+        "fi",
+        'mkdir -p "$analysis_archive"',
+        "echo \"Archiving selected cohort analysis datasinks to $analysis_archive\"",
+    ]
+    for directory_name in COHORT_ANALYSIS_ARCHIVE_DIRS:
+        analysis_archive_lines.extend([
+            f'if [[ -d "$analysis/{directory_name}" ]]; then',
+            f'  cp -av "$analysis/{directory_name}" "$analysis_archive/"',
+            "fi",
+        ])
+    analysis_archive_lines.append(
+        'find "$analysis_archive" -mindepth 1 -maxdepth 1 '
+        + " ".join(
+            f'! -name "{name}"' for name in COHORT_ANALYSIS_ARCHIVE_DIRS
+        )
+        + " -exec rm -rf -- {} +"
+    )
     if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(analysis_workflow))} "
@@ -2085,11 +2194,7 @@ def generate_cohort_script(
             "  " + _shell_command(analysis_command),
             "fi",
             *(
-                [
-                    'mkdir -p "$analysis_archive"',
-                    'echo "Archiving cohort analysis output to $analysis_archive"',
-                    'cp -av "$analysis/." "$analysis_archive/"',
-                ]
+                analysis_archive_lines
                 if archive_outputs
                 else []
             ),
@@ -3171,7 +3276,7 @@ class SubjectManager(QMainWindow):
                 "Select one or more session rows in the session details table.",
             )
             return
-        _, _, results, _, _ = self._project_paths()
+        _, output, results, _, _ = self._project_paths()
         results_value = self.path_fields["results"].text().strip()
         if not results_value:
             QMessageBox.critical(
@@ -3451,7 +3556,7 @@ class SubjectManager(QMainWindow):
                 "Select the subjects whose cleaned timeseries you want to move.",
             )
             return
-        _, _, results, _, _ = self._project_paths()
+        _, output, results, _, _ = self._project_paths()
         if not self.path_fields["results"].text().strip():
             QMessageBox.critical(self, "Results directory not set", "Choose a project root or set a results directory.")
             return
@@ -3467,8 +3572,13 @@ class SubjectManager(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            moved, skipped = move_cleaned_timeseries(selected, results)
-        except OSError as error:
+            moved, skipped = move_cleaned_timeseries(
+                selected,
+                results,
+                output_dir=output,
+                cohort_mode=self.mode_selector.currentData() == "cohort",
+            )
+        except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Could not move cleaned timeseries", str(error))
             return
 
