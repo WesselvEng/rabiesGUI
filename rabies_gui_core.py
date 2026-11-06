@@ -1476,13 +1476,21 @@ def cohort_stage_status(
             for directory in (work_dir, archive_dir)
         )
 
+    confound_dirs = (
+        work_dir / "confound" / "confound_correction_datasink" / "cleaned_timeseries",
+        archive_dir / "confound" / "confound_correction_datasink" / "cleaned_timeseries",
+    )
     fix_data_dirs = (
         work_dir / "fixrabies" / "data",
         archive_dir / "fixrabies" / "data",
     )
     return {
         "preprocess": stage_exists("preprocess", "preprocess"),
-        "confound": stage_exists("confound", "confound_correction"),
+        "confound": any(
+            directory.is_dir()
+            and any(directory.rglob("*_cleaned.nii.gz"))
+            for directory in confound_dirs
+        ),
         "analysis": stage_exists("analysis", "analysis"),
         "fixrabies": any(
             path.is_dir() and any(path.iterdir()) for path in fix_data_dirs
@@ -1678,7 +1686,75 @@ def archive_cohort_outputs(
             )
         if cohort_results.is_symlink() or destination.is_symlink():
             raise ValueError(f"Refusing to archive through a symlink: {destination}")
-        if _copy_archive_directory(source, destination, progress):
+        if stage == "preprocess":
+            source = source / "preprocess_QC_report"
+            destination = destination / "preprocess_QC_report"
+            if destination.parent.is_symlink():
+                raise ValueError(
+                    f"Refusing to archive through a symlink: {destination}"
+                )
+        elif stage == "confound":
+            source = (
+                source / "confound_correction_datasink" / "cleaned_timeseries"
+            )
+            destination = (
+                destination / "confound_correction_datasink" / "cleaned_timeseries"
+            )
+            if (
+                (cohort_output / stage / "confound_correction_datasink").is_symlink()
+                or destination.parent.is_symlink()
+            ):
+                raise ValueError(
+                    f"Refusing to archive through a symlink: {destination}"
+                )
+        copied = _copy_archive_directory(source, destination, progress)
+        if stage in {"preprocess", "confound"}:
+            allowed_root = (
+                "preprocess_QC_report"
+                if stage == "preprocess"
+                else "confound_correction_datasink"
+            )
+            archive_stage = (
+                destination.parent.parent
+                if stage == "confound"
+                else destination.parent
+            )
+            if archive_stage.is_dir():
+                for previous_archive in archive_stage.iterdir():
+                    if previous_archive.name == allowed_root:
+                        continue
+                    if previous_archive.is_symlink() or previous_archive.is_file():
+                        previous_archive.unlink()
+                    elif previous_archive.is_dir():
+                        shutil.rmtree(previous_archive)
+                    logger.info(
+                        "Removed nonessential cohort %s archive: %s",
+                        stage,
+                        previous_archive,
+                    )
+                if stage == "confound" and destination.parent.is_dir():
+                    for previous_archive in destination.parent.iterdir():
+                        if previous_archive.name == "cleaned_timeseries":
+                            continue
+                        if previous_archive.is_symlink() or previous_archive.is_file():
+                            previous_archive.unlink()
+                        elif previous_archive.is_dir():
+                            shutil.rmtree(previous_archive)
+                        logger.info(
+                            "Removed non-timeseries confound archive: %s",
+                            previous_archive,
+                        )
+                if progress is not None:
+                    progress(
+                        (
+                            "Kept only preprocess_QC_report in the cohort "
+                            "preprocessing archive"
+                            if stage == "preprocess"
+                            else "Kept only cleaned_timeseries in the cohort "
+                            "confound archive"
+                        )
+                    )
+        if copied:
             archived.append(destination)
     logger.info("Archived %s cohort output folder(s)", len(archived))
     return archived
@@ -1818,9 +1894,7 @@ def generate_cohort_script(
         else confound
     )
     analysis_preprocess_source = (
-        preprocess_archive
-        if pipeline == "analysis_only" and archive_outputs
-        else preprocess
+        preprocess
     )
     analysis_command = command_base + [
         "-B", bind(bids_dir, "/input_bids", True),
@@ -1911,9 +1985,16 @@ def generate_cohort_script(
             "fi",
             *(
                 [
-                    'mkdir -p "$preprocess_archive"',
-                    'echo "Archiving cohort preprocessing output to $preprocess_archive"',
-                    'cp -av "$preprocess/." "$preprocess_archive/"',
+                    'if [[ -d "$preprocess/preprocess_QC_report" ]]; then',
+                    '  if [[ -L "$preprocess/preprocess_QC_report" || -L "$preprocess_archive" || -L "$preprocess_archive/preprocess_QC_report" ]]; then',
+                    '    echo "Refusing to archive symlinked cohort preprocessing QC output." >&2',
+                    "    exit 1",
+                    "  fi",
+                    '  echo "Archiving cohort preprocessing QC report to $preprocess_archive/preprocess_QC_report"',
+                    '  mkdir -p "$preprocess_archive"',
+                    '  cp -av "$preprocess/preprocess_QC_report" "$preprocess_archive/"',
+                    '  find "$preprocess_archive" -mindepth 1 -maxdepth 1 ! -name "preprocess_QC_report" -exec rm -rf -- {} +',
+                    "fi",
                 ]
                 if archive_outputs
                 else []
@@ -1927,7 +2008,7 @@ def generate_cohort_script(
             '  cp -a "$preprocess_archive/." "$preprocess/"',
             "fi",
             f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
-            '  echo "Archived preprocessing output is missing; run preprocessing first." >&2',
+            '  echo "Working preprocessing output is missing; run preprocessing first." >&2',
             "  exit 1",
             "fi",
         ])
@@ -1943,34 +2024,41 @@ def generate_cohort_script(
             "fi",
             *(
                 [
-                    'mkdir -p "$confound_archive"',
-                    'echo "Archiving cohort confound output to $confound_archive"',
-                    'cp -av "$confound/." "$confound_archive/"',
+                    'if [[ ! -d "$confound/confound_correction_datasink/cleaned_timeseries" ]]; then',
+                    '  echo "Confound-correction cleaned_timeseries folder is missing; cannot archive cohort confound output." >&2',
+                    "  exit 1",
+                    "fi",
+                    'if [[ -L "$confound/confound_correction_datasink" || -L "$confound/confound_correction_datasink/cleaned_timeseries" || -L "$confound_archive" || -L "$confound_archive/confound_correction_datasink" || -L "$confound_archive/confound_correction_datasink/cleaned_timeseries" ]]; then',
+                    '  echo "Refusing to archive symlinked cohort confound output." >&2',
+                    "  exit 1",
+                    "fi",
+                    'echo "Archiving cohort cleaned timeseries to $confound_archive/confound_correction_datasink/cleaned_timeseries"',
+                    'mkdir -p "$confound_archive/confound_correction_datasink"',
+                    'cp -av "$confound/confound_correction_datasink/cleaned_timeseries" "$confound_archive/confound_correction_datasink/"',
+                    'find "$confound_archive" -mindepth 1 -maxdepth 1 ! -name "confound_correction_datasink" -exec rm -rf -- {} +',
+                    'find "$confound_archive/confound_correction_datasink" -mindepth 1 -maxdepth 1 ! -name "cleaned_timeseries" -exec rm -rf -- {} +',
                 ]
                 if archive_outputs
                 else []
             ),
         ])
     if pipeline == "analysis_only":
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+            f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+            '  mkdir -p "$preprocess"',
+            '  cp -a "$preprocess_archive/." "$preprocess/"',
+            "fi",
+        ])
         if not archive_outputs:
             lines.extend([
-                f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
-                f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
-                '  mkdir -p "$preprocess"',
-                '  cp -a "$preprocess_archive/." "$preprocess/"',
-                "fi",
                 f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
                 f"&& -f {shlex.quote(str(archived_confound_workflow))} ]]; then",
                 '  mkdir -p "$confound"',
                 '  cp -a "$confound_archive/." "$confound/"',
                 "fi",
             ])
-        analysis_preprocess_workflow = (
-            archived_preprocess_workflow if archive_outputs else preprocess_workflow
-        )
-        analysis_confound_workflow = (
-            archived_confound_workflow if archive_outputs else confound_workflow
-        )
+        analysis_preprocess_workflow = preprocess_workflow
         analysis_confound_source = confound_archive if archive_outputs else confound
         cleaned_timeseries = (
             analysis_confound_source
@@ -1979,7 +2067,6 @@ def generate_cohort_script(
         )
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(analysis_preprocess_workflow))} "
-            f"|| ! -f {shlex.quote(str(analysis_confound_workflow))} "
             f"|| ! -d {shlex.quote(str(cleaned_timeseries))} "
             f"|| -z \"$(find {shlex.quote(str(cleaned_timeseries))} "
             "-type f -name '*_cleaned.nii.gz' -print -quit)\" ]]; then",
@@ -2049,10 +2136,17 @@ def generate_cohort_script(
             '  echo "Refusing to delete symlinked cohort working output: $cohort" >&2',
             "  exit 1",
             "fi",
-            'if [[ -d "$cohort" ]]; then',
-            '  echo "Removing cohort working output after archive: $cohort"',
-            '  rm -rf -- "$cohort"',
-            "fi",
+            'for working_stage in "$cohort/confound" "$cohort/analysis" "$cohort/fixrabies"; do',
+            '  if [[ -L "$working_stage" ]]; then',
+            '    echo "Refusing to delete symlinked cohort working output: $working_stage" >&2',
+            "    exit 1",
+            "  fi",
+            '  if [[ -d "$working_stage" ]]; then',
+            '    echo "Removing archived cohort working output: $working_stage"',
+            '    rm -rf -- "$working_stage"',
+            "  fi",
+            "done",
+            'echo "Keeping cohort preprocessing output in place; only its QC report was archived."',
         ])
     lines.append("")
     return "\n".join(lines)
@@ -3537,18 +3631,14 @@ class SubjectManager(QMainWindow):
                         + ", ".join(str(path) for path in preprocess_locations)
                     )
             elif pipeline == "analysis_only":
-                if self.archive_outputs.isChecked():
-                    preprocessing_dirs = (results / "cohort" / "preprocess",)
-                    confound_dirs = (results / "cohort" / "confound",)
-                else:
-                    preprocessing_dirs = (
-                        output / "cohort" / "preprocess",
-                        results / "cohort" / "preprocess",
-                    )
-                    confound_dirs = (
-                        output / "cohort" / "confound",
-                        results / "cohort" / "confound",
-                    )
+                preprocessing_dirs = (
+                    output / "cohort" / "preprocess",
+                    results / "cohort" / "preprocess",
+                )
+                confound_dirs = (
+                    output / "cohort" / "confound",
+                    results / "cohort" / "confound",
+                )
                 if not any(
                     _workflow_path(path, "preprocess").is_file()
                     for path in preprocessing_dirs
@@ -3558,16 +3648,13 @@ class SubjectManager(QMainWindow):
                         "preprocessing first."
                     )
                 confound_ready = any(
-                    _workflow_path(path, "confound_correction").is_file()
-                    and any(
+                    any(
                         path.is_file()
                         for path in (
                             confound_dir
                             / "confound_correction_datasink"
                             / "cleaned_timeseries"
-                        ).rglob(
-                            "*_cleaned.nii.gz"
-                        )
+                        ).rglob("*_cleaned.nii.gz")
                     )
                     for confound_dir in confound_dirs
                 )
