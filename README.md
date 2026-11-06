@@ -102,6 +102,9 @@ names may be replaced.
 **Move cleaned timeseries** action moves `*_cleaned.nii.gz` files to
 `<results>/cleaned_timeseries/`; analysis-only reads the prior confound outputs
 from the working folders when archiving is off, or from the archive when on.
+Identical source duplicates are removed after the move so only one copy remains
+in the results tree; same-name files with different contents are reported as
+conflicts and left untouched.
 
 Use **RABIES arguments…** to edit stage CLI arguments before creating scripts.
 For cohort workflows, preprocessing and analysis run across the dataset once.

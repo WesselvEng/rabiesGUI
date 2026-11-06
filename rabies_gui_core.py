@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import filecmp
 import logging
 import os
 import shlex
@@ -951,10 +952,10 @@ def move_cleaned_timeseries(
     output_dir: Path | None = None,
     cohort_mode: bool = False,
 ) -> tuple[list[Path], list[Path]]:
-    """Move selected subjects' cleaned NIfTI files into a shared results folder."""
+    """Move selected cleaned NIfTIs, removing identical duplicate source copies."""
     destination_dir = results_dir / "cleaned_timeseries"
     moved: list[Path] = []
-    skipped: list[Path] = []
+    removed_duplicates: list[Path] = []
 
     if cohort_mode:
         if output_dir is None:
@@ -999,16 +1000,44 @@ def move_cleaned_timeseries(
             )
         source_files.sort()
 
+    sources_by_name: dict[str, list[Path]] = {}
     for source in source_files:
-        destination = destination_dir / source.name
-        if destination.exists():
-            skipped.append(source)
-            continue
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(destination))
-        moved.append(destination)
+        sources_by_name.setdefault(source.name, []).append(source)
 
-    return moved, skipped
+    for name, sources in sources_by_name.items():
+        destination = destination_dir / name
+        if destination.exists() and not destination.is_file():
+            raise ValueError(
+                f"Cleaned-timeseries destination is not a file: {destination}"
+            )
+        candidates = ([destination] if destination.is_file() else []) + sources
+        reference = candidates[0]
+        conflicting = [
+            candidate
+            for candidate in candidates[1:]
+            if not filecmp.cmp(reference, candidate, shallow=False)
+        ]
+        if conflicting:
+            paths = ", ".join(str(path) for path in candidates)
+            raise ValueError(
+                f"Different cleaned timeseries share the filename {name!r}; "
+                f"no files were moved. Resolve the conflicting files: {paths}"
+            )
+
+    for name, sources in sources_by_name.items():
+        destination = destination_dir / name
+        if destination.is_file():
+            duplicates = sources
+        else:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(sources[0]), str(destination))
+            moved.append(destination)
+            duplicates = sources[1:]
+        for duplicate in duplicates:
+            duplicate.unlink()
+            removed_duplicates.append(duplicate)
+
+    return moved, removed_duplicates
 
 
 def _shell_command(arguments: list[str]) -> str:
@@ -3566,13 +3595,14 @@ class SubjectManager(QMainWindow):
             self,
             "Move cleaned timeseries",
             f"Move cleaned NIfTI files for {len(selected)} selected subject(s) into\n"
-            f"{destination_dir}?\nExisting files with the same name will be skipped.",
+            f"{destination_dir}?\nIdentical duplicate copies will be removed. "
+            "Different files with the same name will be reported as a conflict.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            moved, skipped = move_cleaned_timeseries(
+            moved, removed_duplicates = move_cleaned_timeseries(
                 selected,
                 results,
                 output_dir=output,
@@ -3583,11 +3613,12 @@ class SubjectManager(QMainWindow):
             return
 
         self.status.setText(
-            f"Moved {len(moved)} cleaned timeseries; skipped {len(skipped)} name collision(s)."
+            f"Moved {len(moved)} cleaned timeseries; removed "
+            f"{len(removed_duplicates)} duplicate source copy/copies."
         )
         message = (
             f"Moved {len(moved)} file(s) to {destination_dir}."
-            f"\nSkipped {len(skipped)} file(s) because the destination filename already exists."
+            f"\nRemoved {len(removed_duplicates)} identical duplicate source copy/copies."
         )
         QMessageBox.information(self, "Cleaned timeseries", message)
 
