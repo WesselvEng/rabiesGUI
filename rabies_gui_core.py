@@ -18,12 +18,14 @@ from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -44,14 +46,18 @@ from PySide6.QtWidgets import (
 DEFAULT_RABIES_IMAGE = ""
 DEFAULT_TEMPLATES = ""
 SPLASH_IMAGE = Path(__file__).with_name("RABIES-RABIES.png")
-PIPELINE_VARIANTS = (
+NORMAL_PIPELINE_VARIANTS = (
     ("Preprocessing only", "preproc_only"),
     ("Preprocessing + confound correction", "preproc_confound"),
+    ("Analysis only (from confound cleaned timeseries)", "analysis_only"),
     ("Whole pipeline", "whole_pipeline"),
+)
+FIX_PIPELINE_VARIANTS = (
     ("Preprocessing + FIXRABIES prepare", "fixrabies_prepare"),
     ("FIXRABIES prepare only", "fixrabies_prepare_only"),
 )
-COHORT_PIPELINE_VARIANTS = PIPELINE_VARIANTS[:-1]
+PIPELINE_VARIANTS = NORMAL_PIPELINE_VARIANTS + FIX_PIPELINE_VARIANTS
+COHORT_PIPELINE_VARIANTS = PIPELINE_VARIANTS
 FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
 FIX_DIRECTORY_PREFIX = "fixrabies_"
 FIX_SUBJECTS_FILE = ".rabies_gui_subjects.txt"
@@ -390,6 +396,7 @@ def pipeline_has_previous_results(
     completed_stages = {
         "preproc_only": ("preprocess", "confound", "analysis"),
         "preproc_confound": ("confound", "analysis"),
+        "analysis_only": ("analysis",),
         "whole_pipeline": ("analysis",),
         "fixrabies_prepare": ("fixrabies",),
         "fixrabies_prepare_only": ("fixrabies",),
@@ -1006,10 +1013,29 @@ def generate_subject_script(
         str(rabies_image), "-f", "confound_correction",
         "/preprocess_outputs/", "/confound_correction_outputs/",
     ] + shlex.split(confound_args)
+    analysis_confound_source = (
+        confound_archive if pipeline == "analysis_only" else confound
+    )
+    analysis_bids_source = session_archive if pipeline == "analysis_only" else bids
+    analysis_preprocess_source = (
+        preprocess_archive if pipeline == "analysis_only" else preprocess
+    )
     analysis_command = command_base + [
-        "-B", bind(bids, "/input_bids", True),
-        "-B", bind(preprocess, "/preprocess_outputs"),
-        "-B", bind(confound, "/confound_correction_outputs"),
+        "-B", bind(
+            analysis_bids_source,
+            "/input_bids",
+            pipeline == "analysis_only",
+        ),
+        "-B", bind(
+            analysis_preprocess_source,
+            "/preprocess_outputs",
+            pipeline == "analysis_only",
+        ),
+        "-B", bind(
+            analysis_confound_source,
+            "/confound_correction_outputs",
+            pipeline == "analysis_only",
+        ),
         "-B", bind(analysis, "/analysis_outputs"),
         "-B", bind(templates_dir, "/templates", True),
         str(rabies_image), "-f", "-p", "MultiProc", "analysis",
@@ -1076,7 +1102,7 @@ def generate_subject_script(
         f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis_archive={shlex.quote(str(analysis_archive))}",
     ]
-    if pipeline != "fixrabies_prepare_only":
+    if pipeline not in {"fixrabies_prepare_only", "analysis_only"}:
         lines.extend([
             'mkdir -p "$bids_parent" "$preprocess"',
             'bids_staging=$(mktemp -d "$bids_parent/.${session_name}.XXXXXX")',
@@ -1098,6 +1124,9 @@ def generate_subject_script(
             'bids_staging=""',
         ])
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
+    archived_preprocess_workflow = _workflow_path(
+        preprocess_archive, "preprocess"
+    )
     confound_workflow = _workflow_path(confound, "confound_correction")
     confound_cli = confound / "rabies_confound_correction.pkl"
     analysis_workflow = _workflow_path(analysis, "analysis")
@@ -1106,7 +1135,7 @@ def generate_subject_script(
         "",
         f"result_session={shlex.quote(str(result_session))}",
     ])
-    if pipeline == "whole_pipeline":
+    if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.extend([
             f"if [[ -d {shlex.quote(str(analysis_archive))} "
             f"&& -n \"$(find {shlex.quote(str(analysis_archive))} -mindepth 1 -maxdepth 1 -print -quit)\" ]]; then",
@@ -1115,9 +1144,6 @@ def generate_subject_script(
             "fi",
         ])
     if pipeline == "fixrabies_prepare_only":
-        archived_preprocess_workflow = _workflow_path(
-            preprocess_archive, "preprocess"
-        )
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
             f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
@@ -1135,7 +1161,7 @@ def generate_subject_script(
             "  exit 1",
             "fi",
         ])
-    else:
+    elif pipeline != "analysis_only":
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
             f"  {_shell_command(preprocess_command)}",
@@ -1190,17 +1216,40 @@ def generate_subject_script(
             f"  ) 9>{shlex.quote(str(fix_dir / '.rabies_gui_prepare.lock'))}",
             "fi",
         ])
-    if pipeline == "whole_pipeline":
+    if pipeline == "analysis_only":
+        cleaned_timeseries = (
+            confound_archive
+            / "confound_correction_datasink"
+            / "cleaned_timeseries"
+        )
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(archived_preprocess_workflow))} "
+            f"|| ! -d {shlex.quote(str(session_archive))} "
+            f"|| ! -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+            f"|| ! -d {shlex.quote(str(cleaned_timeseries))} "
+            f"|| -z \"$(find {shlex.quote(str(cleaned_timeseries))} "
+            "-type f -name '*_cleaned.nii.gz' -print -quit)\" ]]; then",
+            '  echo "Archived confound-correction cleaned timeseries are missing for $subject session $session_name; run confound correction first and keep its cleaned_timeseries folder intact." >&2',
+            "  exit 1",
+            "fi",
+        ])
+    if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.extend([
             'mkdir -p "$analysis"',
-            f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
-            f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
-            f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
-            f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
-            f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
-            f"  cp -f {shlex.quote(str(confound_archive / confound_workflow.name))} \"$confound/\"",
-            f"  cp -f {shlex.quote(str(confound_archive / confound_cli.name))} \"$confound/\"",
-            "fi",
+            *(
+                [
+                    f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+                    f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+                    f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
+                    f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
+                    f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
+                    f"  cp -f {shlex.quote(str(confound_archive / confound_workflow.name))} \"$confound/\"",
+                    f"  cp -f {shlex.quote(str(confound_archive / confound_cli.name))} \"$confound/\"",
+                    "fi",
+                ]
+                if pipeline == "whole_pipeline"
+                else []
+            ),
             f"if [[ ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} "
             f"&& ! -f {shlex.quote(str(legacy_analysis_marker))} ]]; then",
             f"  if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
@@ -1210,7 +1259,7 @@ def generate_subject_script(
             f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
             "fi",
         ])
-    if pipeline != "fixrabies_prepare_only":
+    if pipeline not in {"fixrabies_prepare_only", "analysis_only"}:
         lines.extend([
             'mkdir -p "$session_archive"',
             'cp -a "$bids/." "$session_archive/"',
@@ -1367,10 +1416,20 @@ def generate_cohort_script(
         "confound_correction",
         "/preprocess_outputs/", "/confound_correction_outputs/",
     ] + shlex.split(confound_args)
+    analysis_confound_source = (
+        confound_archive if pipeline == "analysis_only" else confound
+    )
+    analysis_preprocess_source = (
+        preprocess_archive if pipeline == "analysis_only" else preprocess
+    )
     analysis_command = command_base + [
         "-B", bind(bids_dir, "/input_bids", True),
-        "-B", bind(preprocess, "/preprocess_outputs", True),
-        "-B", bind(confound, "/confound_correction_outputs"),
+        "-B", bind(analysis_preprocess_source, "/preprocess_outputs", True),
+        "-B", bind(
+            analysis_confound_source,
+            "/confound_correction_outputs",
+            pipeline == "analysis_only",
+        ),
         "-B", bind(analysis, "/analysis_outputs"),
         "-B", bind(templates_dir, "/templates", True),
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
@@ -1421,27 +1480,42 @@ def generate_cohort_script(
         '  echo "BIDS input directory not found: $bids_source" >&2',
         "  exit 1",
         "fi",
-        'mkdir -p "$cohort" "$cohort_archive" "$preprocess"',
+        'mkdir -p "$cohort" "$cohort_archive"',
         f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {bids_dir}')}",
     ]
+    if pipeline not in {"analysis_only", "fixrabies_prepare_only"}:
+        lines.append('mkdir -p "$preprocess"')
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.append('mkdir -p "$confound"')
-    if pipeline == "whole_pipeline":
+    if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.append('mkdir -p "$analysis"')
-    if pipeline == "fixrabies_prepare":
+    if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         lines.append('mkdir -p "$fix_dir"')
-    lines.extend([
-        f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
-        f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
-        '  mkdir -p "$preprocess"',
-        '  cp -a "$preprocess_archive/." "$preprocess/"',
-        "fi",
-        f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
-        "  " + _shell_command(preprocess_command),
-        "fi",
-        'mkdir -p "$preprocess_archive"',
-        'cp -a "$preprocess/." "$preprocess_archive/"',
-    ])
+    if pipeline not in {"analysis_only", "fixrabies_prepare_only"}:
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+            f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+            '  mkdir -p "$preprocess"',
+            '  cp -a "$preprocess_archive/." "$preprocess/"',
+            "fi",
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+            "  " + _shell_command(preprocess_command),
+            "fi",
+            'mkdir -p "$preprocess_archive"',
+            'cp -a "$preprocess/." "$preprocess_archive/"',
+        ])
+    if pipeline == "fixrabies_prepare_only":
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+            f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+            '  mkdir -p "$preprocess"',
+            '  cp -a "$preprocess_archive/." "$preprocess/"',
+            "fi",
+            f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+            '  echo "Archived preprocessing output is missing; run preprocessing first." >&2',
+            "  exit 1",
+            "fi",
+        ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
@@ -1455,7 +1529,23 @@ def generate_cohort_script(
             'mkdir -p "$confound_archive"',
             'cp -a "$confound/." "$confound_archive/"',
         ])
-    if pipeline == "whole_pipeline":
+    if pipeline == "analysis_only":
+        cleaned_timeseries = (
+            confound_archive
+            / "confound_correction_datasink"
+            / "cleaned_timeseries"
+        )
+        lines.extend([
+            f"if [[ ! -f {shlex.quote(str(archived_preprocess_workflow))} "
+            f"|| ! -f {shlex.quote(str(archived_confound_workflow))} "
+            f"|| ! -d {shlex.quote(str(cleaned_timeseries))} "
+            f"|| -z \"$(find {shlex.quote(str(cleaned_timeseries))} "
+            "-type f -name '*_cleaned.nii.gz' -print -quit)\" ]]; then",
+            '  echo "Archived cohort confound-correction cleaned timeseries are missing; run confound correction first and keep its cleaned_timeseries folder intact." >&2',
+            "  exit 1",
+            "fi",
+        ])
+    if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.extend([
             f"if [[ ! -f {shlex.quote(str(analysis_workflow))} "
             f"&& -f {shlex.quote(str(archived_analysis_workflow))} ]]; then",
@@ -1468,7 +1558,7 @@ def generate_cohort_script(
             'mkdir -p "$analysis_archive"',
             'cp -a "$analysis/." "$analysis_archive/"',
         ])
-    if pipeline == "fixrabies_prepare":
+    if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         fix_data = fix_dir / "data"
         fix_marker = fix_dir / ".prepare_complete"
         archived_fix_marker = fix_archive / ".prepare_complete"
@@ -1766,6 +1856,45 @@ class SubjectManager(QMainWindow):
         self.update_project_label()
         self.refresh_subjects()
 
+    def _pipeline_cards(
+        self,
+        selector: QComboBox,
+        variants: tuple[tuple[str, str], ...],
+    ) -> QWidget:
+        cards = QWidget()
+        grid = QGridLayout(cards)
+        grid.setContentsMargins(0, 0, 0, 0)
+        group = QButtonGroup(cards)
+        group.setExclusive(True)
+        buttons: dict[str, QPushButton] = {}
+        for index, (label, variant) in enumerate(variants):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setMinimumHeight(48)
+            button.setStyleSheet(
+                "QPushButton { border: 2px solid #5f6368; padding: 8px; "
+                "font-weight: 600; } "
+                "QPushButton:checked { border: 3px solid #8ab4f8; "
+                "background-color: #2b4d7e; }"
+            )
+            group.addButton(button)
+            buttons[variant] = button
+            grid.addWidget(button, index // 2, index % 2)
+            button.clicked.connect(
+                lambda _checked=False, selected=variant: selector.setCurrentIndex(
+                    selector.findData(selected)
+                )
+            )
+
+        def update_checked(_index: int = -1) -> None:
+            selected = selector.currentData()
+            for variant, button in buttons.items():
+                button.setChecked(variant == selected)
+
+        selector.currentIndexChanged.connect(update_checked)
+        update_checked()
+        return cards
+
     def _build_ui(self) -> None:
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
@@ -1886,15 +2015,37 @@ class SubjectManager(QMainWindow):
         self.pipeline_selector = QComboBox()
         for label, pipeline in PIPELINE_VARIANTS:
             self.pipeline_selector.addItem(label, pipeline)
-        options.addWidget(self.pipeline_selector)
+        self.pipeline_selector.setCurrentIndex(
+            self.pipeline_selector.findData("whole_pipeline")
+        )
+        self.pipeline_selector.hide()
+        create_scripts = QPushButton("Create script")
+        create_scripts.clicked.connect(self.create_scripts)
+        options.addWidget(create_scripts)
+        single_subject_layout.addLayout(options)
+
+        pipeline_options = QHBoxLayout()
+        pipeline_options.addWidget(QLabel("Workflow mode:"))
+        self.pipeline_mode_selector = QComboBox()
+        self.pipeline_mode_selector.addItem("Normal mode", "normal")
+        self.pipeline_mode_selector.addItem("FIX mode", "fix")
+        pipeline_options.addWidget(self.pipeline_mode_selector)
+        self.normal_pipeline_cards = self._pipeline_cards(
+            self.pipeline_selector, NORMAL_PIPELINE_VARIANTS
+        )
+        self.fix_pipeline_cards = self._pipeline_cards(
+            self.pipeline_selector, FIX_PIPELINE_VARIANTS
+        )
+        pipeline_options.addWidget(self.normal_pipeline_cards, 1)
+        pipeline_options.addWidget(self.fix_pipeline_cards, 1)
+        single_subject_layout.addLayout(pipeline_options)
+
         self.fix_species_selector = QComboBox()
         self.fix_species_selector.addItems(FIXRABIES_SPECIES)
         self.fix_species_selector.setToolTip(
             "Choose the FIXRABIES species that matches the RABIES common-space template."
         )
-        self.fix_species_selector.setEnabled(False)
         self.fix_directory_selector = QComboBox()
-        self.fix_directory_selector.setEnabled(False)
         self.fix_directory_selector.setMinimumWidth(210)
         self.fix_directory_selector.setToolTip(
             "Create a new shared project-level folder or add these subjects to an existing FIXRABIES folder."
@@ -1909,21 +2060,22 @@ class SubjectManager(QMainWindow):
         self.pipeline_selector.currentIndexChanged.connect(
             self._update_fix_controls
         )
+        self.pipeline_mode_selector.currentIndexChanged.connect(
+            self._update_fix_controls
+        )
         self.fix_directory_selector.currentIndexChanged.connect(
             self._update_fix_controls
         )
-        create_scripts = QPushButton("Create script")
-        create_scripts.clicked.connect(self.create_scripts)
-        options.addWidget(create_scripts)
-        single_subject_layout.addLayout(options)
-        fix_options = QHBoxLayout()
+        self.fix_options = QWidget()
+        fix_options = QHBoxLayout(self.fix_options)
+        fix_options.setContentsMargins(0, 0, 0, 0)
         fix_options.addWidget(QLabel("FIX species:"))
         fix_options.addWidget(self.fix_species_selector)
         fix_options.addWidget(QLabel("FIX folder:"))
         fix_options.addWidget(self.fix_directory_selector)
         fix_options.addWidget(QLabel("New folder name:"))
         fix_options.addWidget(self.fix_directory_name, 1)
-        single_subject_layout.addLayout(fix_options)
+        single_subject_layout.addWidget(self.fix_options)
 
         cleanup_options = QHBoxLayout()
         cleanup_options.addWidget(QLabel("Archived results (permanent deletion):"))
@@ -1950,25 +2102,44 @@ class SubjectManager(QMainWindow):
         self.cohort_controls = QWidget()
         cohort_controls_layout = QVBoxLayout(self.cohort_controls)
         cohort_controls_layout.setContentsMargins(0, 0, 0, 0)
-        cohort_options = QHBoxLayout()
-        cohort_options.addWidget(QLabel("Cohort pipeline:"))
         self.cohort_pipeline_selector = QComboBox()
         for label, pipeline in COHORT_PIPELINE_VARIANTS:
             self.cohort_pipeline_selector.addItem(label, pipeline)
-        cohort_options.addWidget(self.cohort_pipeline_selector)
-        cohort_options.addWidget(QLabel("FIX species:"))
+        self.cohort_pipeline_selector.setCurrentIndex(
+            self.cohort_pipeline_selector.findData("whole_pipeline")
+        )
+        self.cohort_pipeline_selector.hide()
+
+        cohort_pipeline_options = QHBoxLayout()
+        cohort_pipeline_options.addWidget(QLabel("Workflow mode:"))
+        self.cohort_pipeline_mode_selector = QComboBox()
+        self.cohort_pipeline_mode_selector.addItem("Normal mode", "normal")
+        self.cohort_pipeline_mode_selector.addItem("FIX mode", "fix")
+        cohort_pipeline_options.addWidget(self.cohort_pipeline_mode_selector)
+        self.cohort_normal_pipeline_cards = self._pipeline_cards(
+            self.cohort_pipeline_selector, NORMAL_PIPELINE_VARIANTS
+        )
+        self.cohort_fix_pipeline_cards = self._pipeline_cards(
+            self.cohort_pipeline_selector, FIX_PIPELINE_VARIANTS
+        )
+        cohort_pipeline_options.addWidget(self.cohort_normal_pipeline_cards, 1)
+        cohort_pipeline_options.addWidget(self.cohort_fix_pipeline_cards, 1)
+        cohort_controls_layout.addLayout(cohort_pipeline_options)
+
         self.cohort_fix_species_selector = QComboBox()
         self.cohort_fix_species_selector.addItems(FIXRABIES_SPECIES)
-        self.cohort_fix_species_selector.setEnabled(False)
         self.cohort_fix_species_selector.setToolTip(
             "Choose the FIXRABIES species that matches the RABIES common-space template."
         )
-        self.cohort_pipeline_selector.currentIndexChanged.connect(
-            lambda _index: self.cohort_fix_species_selector.setEnabled(
-                self.cohort_pipeline_selector.currentData() == "fixrabies_prepare"
-            )
-        )
-        cohort_options.addWidget(self.cohort_fix_species_selector)
+        self.cohort_fix_options = QWidget()
+        cohort_fix_options = QHBoxLayout(self.cohort_fix_options)
+        cohort_fix_options.setContentsMargins(0, 0, 0, 0)
+        cohort_fix_options.addWidget(QLabel("FIX species:"))
+        cohort_fix_options.addWidget(self.cohort_fix_species_selector)
+        cohort_fix_options.addStretch()
+        cohort_controls_layout.addWidget(self.cohort_fix_options)
+
+        cohort_options = QHBoxLayout()
         for label, callback in (
             ("Create cohort script", self.create_cohort_script),
             ("Submit cohort with sbatch", self.submit_cohort_script),
@@ -1978,6 +2149,12 @@ class SubjectManager(QMainWindow):
             button.clicked.connect(callback)
             cohort_options.addWidget(button)
         cohort_controls_layout.addLayout(cohort_options)
+        self.cohort_pipeline_selector.currentIndexChanged.connect(
+            self._update_cohort_pipeline_controls
+        )
+        self.cohort_pipeline_mode_selector.currentIndexChanged.connect(
+            self._update_cohort_pipeline_controls
+        )
 
         cohort_cleanup = QHBoxLayout()
         cohort_cleanup.addWidget(QLabel("Cohort cleanup:"))
@@ -2004,6 +2181,8 @@ class SubjectManager(QMainWindow):
 
     def _update_mode_controls(self, _index: int = -1) -> None:
         cohort_mode = self.mode_selector.currentData() == "cohort"
+        self._update_fix_controls()
+        self._update_cohort_pipeline_controls()
         self.single_subject_controls.setVisible(not cohort_mode)
         self.cohort_controls.setVisible(cohort_mode)
         self.cohort_stage_label.setVisible(cohort_mode)
@@ -2072,15 +2251,37 @@ class SubjectManager(QMainWindow):
         self.cohort_stage_label.setText(f"Cohort-wide stages: {status}")
 
     def _update_fix_controls(self, _index: int = -1) -> None:
-        enabled = self.pipeline_selector.currentData() in {
-            "fixrabies_prepare",
-            "fixrabies_prepare_only",
-        }
-        self.fix_species_selector.setEnabled(enabled)
-        self.fix_directory_selector.setEnabled(enabled)
+        fix_mode = self.pipeline_mode_selector.currentData() == "fix"
+        variants = FIX_PIPELINE_VARIANTS if fix_mode else NORMAL_PIPELINE_VARIANTS
+        allowed = {variant for _, variant in variants}
+        if self.pipeline_selector.currentData() not in allowed:
+            default = "fixrabies_prepare" if fix_mode else "whole_pipeline"
+            self.pipeline_selector.setCurrentIndex(
+                self.pipeline_selector.findData(default)
+            )
+        self.normal_pipeline_cards.setVisible(not fix_mode)
+        self.fix_pipeline_cards.setVisible(fix_mode)
+        self.fix_options.setVisible(fix_mode)
+        self.fix_species_selector.setEnabled(fix_mode)
+        self.fix_directory_selector.setEnabled(fix_mode)
         self.fix_directory_name.setEnabled(
-            enabled and self.fix_directory_selector.currentData() == FIX_CREATE_NEW
+            fix_mode
+            and self.fix_directory_selector.currentData() == FIX_CREATE_NEW
         )
+
+    def _update_cohort_pipeline_controls(self, _index: int = -1) -> None:
+        fix_mode = self.cohort_pipeline_mode_selector.currentData() == "fix"
+        variants = FIX_PIPELINE_VARIANTS if fix_mode else NORMAL_PIPELINE_VARIANTS
+        allowed = {variant for _, variant in variants}
+        if self.cohort_pipeline_selector.currentData() not in allowed:
+            default = "fixrabies_prepare" if fix_mode else "whole_pipeline"
+            self.cohort_pipeline_selector.setCurrentIndex(
+                self.cohort_pipeline_selector.findData(default)
+            )
+        self.cohort_normal_pipeline_cards.setVisible(not fix_mode)
+        self.cohort_fix_pipeline_cards.setVisible(fix_mode)
+        self.cohort_fix_options.setVisible(fix_mode)
+        self.cohort_fix_species_selector.setEnabled(fix_mode)
 
     def _refresh_fix_directory_options(self, project_root: Path) -> None:
         selected = self.fix_directory_selector.currentData()
@@ -2697,22 +2898,44 @@ class SubjectManager(QMainWindow):
                 "Select a project root or set a results directory.",
             )
             return
-        if not templates.is_dir():
-            QMessageBox.critical(
-                self, "Templates not found",
-                f"Template directory does not exist: {templates}",
-            )
-            return
-        if not image.is_file():
-            QMessageBox.critical(
-                self, "RABIES image not found",
-                f"Apptainer image does not exist: {image}",
-            )
-            return
+        if pipeline != "fixrabies_prepare_only":
+            if not templates.is_dir():
+                QMessageBox.critical(
+                    self, "Templates not found",
+                    f"Template directory does not exist: {templates}",
+                )
+                return
+            if not image.is_file():
+                QMessageBox.critical(
+                    self, "RABIES image not found",
+                    f"Apptainer image does not exist: {image}",
+                )
+                return
         try:
             subjects = discover_subjects(
                 bids_dir, self.path_fields["subject_prefix"].text().strip()
             )
+            if pipeline == "fixrabies_prepare_only":
+                preprocess_locations = (
+                    output / "cohort" / "preprocess",
+                    results / "cohort" / "preprocess",
+                )
+                if not any(
+                    _workflow_path(location, "preprocess").is_file()
+                    for location in preprocess_locations
+                ):
+                    raise ValueError(
+                        "Cohort preprocessing output is missing. Run "
+                        "preprocessing first; checked: "
+                        + ", ".join(str(path) for path in preprocess_locations)
+                    )
+            elif pipeline == "analysis_only" and not _workflow_path(
+                results / "cohort" / "preprocess", "preprocess"
+            ).is_file():
+                raise ValueError(
+                    "Archived cohort preprocessing output is missing. Run "
+                    "preprocessing first."
+                )
             script = generate_cohort_script(
                 bids_dir,
                 results,
@@ -3046,6 +3269,39 @@ class SubjectManager(QMainWindow):
                                 f"{subject}/{session}. Checked: "
                                 f"{', '.join(str(path) for path in preprocess_workflows)}. "
                                 "Run preprocessing first."
+                            )
+                    elif pipeline == "analysis_only":
+                        session_results = results / subject / session_name
+                        preprocess_archive = session_results / "preprocess"
+                        input_archive = session_results / "input_bids"
+                        if (
+                            not _workflow_path(
+                                preprocess_archive, "preprocess"
+                            ).is_file()
+                            or not input_archive.is_dir()
+                        ):
+                            raise ValueError(
+                                f"Archived preprocessing and BIDS inputs are "
+                                f"missing for {subject}/{session}. Run a "
+                                "preprocessing workflow first."
+                            )
+                        cleaned_timeseries = (
+                            session_results
+                            / "confound"
+                            / "confound_correction_datasink"
+                            / "cleaned_timeseries"
+                        )
+                        if not any(
+                            path.is_file()
+                            for path in cleaned_timeseries.rglob(
+                                "*_cleaned.nii.gz"
+                            )
+                        ):
+                            raise ValueError(
+                                f"Archived confound cleaned timeseries are "
+                                f"missing for {subject}/{session}: "
+                                f"{cleaned_timeseries}. Run confound correction "
+                                "first and keep its cleaned_timeseries folder intact."
                             )
                     script = generate_subject_script(
                         subject,
