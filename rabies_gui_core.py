@@ -3,17 +3,20 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import nibabel as nib
 from nibabel.filebasedimages import ImageFileError
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,6 +67,7 @@ FIX_SUBJECTS_FILE = ".rabies_gui_subjects.txt"
 FIX_SPECIES_FILE = ".rabies_gui_species.txt"
 FIX_CREATE_NEW = "__create_new__"
 SINGLE_SUBJECT_OUTPUT_DIR = "single-subject"
+logger = logging.getLogger("rabies_gui")
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -205,6 +209,23 @@ def _workflow_path(directory: Path, stage: str) -> Path:
     return directory / f"rabies_{stage}_workflow.pkl"
 
 
+SUBJECT_ARCHIVE_DIRECTORIES = (
+    "tmp_bids_session",
+    "func_preprocess",
+    "func_confound",
+    "func_analysis",
+)
+
+
+def _subject_archive_stage(
+    results_dir: Path, stage_directory: str, subject: str, session: str
+) -> Path:
+    return (
+        results_dir / SINGLE_SUBJECT_OUTPUT_DIR
+        / stage_directory / subject / _session_result_name(session)
+    )
+
+
 def _session_result_name(session: str | None) -> str:
     if session in (None, "No session"):
         return "no-session"
@@ -216,10 +237,27 @@ def _session_result_name(session: str | None) -> str:
 def subject_has_previous_results(
     subject: str, results_dir: Path, session: str | None = None
 ) -> bool:
-    subject_results = results_dir / subject
     if session is not None:
-        subject_results = subject_results / _session_result_name(session)
-    if subject_results.is_dir() and any(subject_results.iterdir()):
+        session_name = _session_result_name(session)
+        if any(
+            (stage_path := _subject_archive_stage(
+                results_dir, stage, subject, session_name
+            )).is_dir()
+            and any(stage_path.iterdir())
+            for stage in SUBJECT_ARCHIVE_DIRECTORIES
+        ):
+            return True
+        legacy_session = results_dir / subject / session_name
+        if legacy_session.is_dir() and any(legacy_session.iterdir()):
+            return True
+    elif any(
+        (stage_path := results_dir / SINGLE_SUBJECT_OUTPUT_DIR / stage / subject).is_dir()
+        and any(stage_path.iterdir())
+        for stage in SUBJECT_ARCHIVE_DIRECTORIES
+    ):
+        return True
+    legacy_subject = results_dir / subject
+    if session is None and legacy_subject.is_dir() and any(legacy_subject.iterdir()):
         return True
     shared_cleaned = results_dir / "cleaned_timeseries"
     if not shared_cleaned.is_dir():
@@ -392,7 +430,13 @@ def pipeline_has_previous_results(
     pipeline: str,
     fix_dir: Path | None = None,
 ) -> bool:
-    session_results = results_dir / subject / _session_result_name(session)
+    session_name = _session_result_name(session)
+    stage_directories = {
+        "preprocess": "func_preprocess",
+        "confound": "func_confound",
+        "analysis": "func_analysis",
+        "fixrabies": "fixrabies",
+    }
     completed_stages = {
         "preproc_only": ("preprocess", "confound", "analysis"),
         "preproc_confound": ("confound", "analysis"),
@@ -402,8 +446,16 @@ def pipeline_has_previous_results(
         "fixrabies_prepare_only": ("fixrabies",),
     }[pipeline]
     if any(
-        (stage_results := session_results / stage).is_dir()
-        and any(stage_results.iterdir())
+        (
+            (stage_results := _subject_archive_stage(
+                results_dir, stage_directories[stage], subject, session_name
+            )).is_dir()
+            and any(stage_results.iterdir())
+        )
+        or (
+            (legacy_stage := results_dir / subject / session_name / stage).is_dir()
+            and any(legacy_stage.iterdir())
+        )
         for stage in completed_stages
     ):
         return True
@@ -445,7 +497,14 @@ def clear_results(results_dir: Path, subjects: list[str] | None = None) -> int:
         for subject in subjects:
             if not subject or Path(subject).name != subject or subject in {".", ".."}:
                 raise ValueError(f"Invalid subject directory name: {subject!r}")
-        targets = [results_dir / subject for subject in subjects]
+        targets = [
+            results_dir / subject
+            for subject in subjects
+        ] + [
+            results_dir / SINGLE_SUBJECT_OUTPUT_DIR / stage / subject
+            for stage in SUBJECT_ARCHIVE_DIRECTORIES
+            for subject in subjects
+        ]
 
     removed = 0
     for target in targets:
@@ -476,13 +535,18 @@ def clear_session_results(
     removed = 0
     for session in sessions:
         session_name = _session_result_name(session)
-        target = results_dir / subject / session_name
-        if target.is_symlink() or target.is_file():
-            target.unlink()
-            removed += 1
-        elif target.is_dir():
-            shutil.rmtree(target)
-            removed += 1
+        targets = [
+            _subject_archive_stage(results_dir, stage, subject, session_name)
+            for stage in SUBJECT_ARCHIVE_DIRECTORIES
+        ]
+        targets.append(results_dir / subject / session_name)
+        for target in targets:
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+                removed += 1
+            elif target.is_dir():
+                shutil.rmtree(target)
+                removed += 1
         cleaned_dir = results_dir / "cleaned_timeseries"
         if cleaned_dir.is_dir():
             token = f"_{session_name}_" if session_name != "no-session" else None
@@ -591,27 +655,45 @@ def stage_status(
     subject_output = output_dir / "func_preprocess" / subject
     confound_output = output_dir / "func_confound" / subject
     analysis_output = output_dir / "func_analysis" / subject
-    subject_results = results_dir / subject
+    archive_root = results_dir / SINGLE_SUBJECT_OUTPUT_DIR
+    legacy_subject_results = results_dir / subject
     if session is not None:
         session_name = _session_result_name(session)
         subject_output /= session_name
         confound_output /= session_name
         analysis_output /= session_name
-        subject_results /= session_name
+        legacy_subject_results /= session_name
 
+    archive_session = (
+        _session_result_name(session) if session is not None else None
+    )
+    preprocess_archive = archive_root / "func_preprocess" / subject
+    confound_archive = archive_root / "func_confound" / subject
+    analysis_archive = archive_root / "func_analysis" / subject
+    if archive_session is not None:
+        preprocess_archive /= archive_session
+        confound_archive /= archive_session
+        analysis_archive /= archive_session
     preprocess_candidates = (
         _workflow_path(subject_output, "preprocess"),
-        _workflow_path(subject_results / "preprocess", "preprocess"),
+        _workflow_path(preprocess_archive, "preprocess"),
+        _workflow_path(legacy_subject_results / "preprocess", "preprocess"),
     )
     confound_candidates = (
         _workflow_path(confound_output, "confound_correction"),
-        _workflow_path(subject_results / "confound", "confound_correction"),
+        _workflow_path(confound_archive, "confound_correction"),
+        _workflow_path(
+            legacy_subject_results / "confound", "confound_correction"
+        ),
     )
     analysis_candidates = (
         _workflow_path(analysis_output, "analysis"),
-        _workflow_path(subject_results / "analysis", "analysis"),
-        _workflow_path(subject_results / "analysis" / subject, "analysis"),
-        subject_results / "analysis" / subject / "rabies_analysis.pkl",
+        _workflow_path(analysis_archive, "analysis"),
+        _workflow_path(legacy_subject_results / "analysis", "analysis"),
+        _workflow_path(
+            legacy_subject_results / "analysis" / subject, "analysis"
+        ),
+        legacy_subject_results / "analysis" / subject / "rabies_analysis.pkl",
     )
     fix_session = session if session is not None else "No session"
     fix_complete = project_root is not None and any(
@@ -866,12 +948,15 @@ def move_cleaned_timeseries(subjects: list[str], results_dir: Path) -> tuple[lis
     skipped: list[Path] = []
 
     for subject in subjects:
-        subject_results = results_dir / subject
-        if not subject_results.is_dir():
-            continue
+        subject_results = (
+            results_dir / SINGLE_SUBJECT_OUTPUT_DIR / "func_confound" / subject,
+            results_dir / subject,
+        )
         source_dirs = sorted(
             path
-            for path in subject_results.rglob("cleaned_timeseries")
+            for subject_root in subject_results
+            if subject_root.is_dir()
+            for path in subject_root.rglob("cleaned_timeseries")
             if path.parent.name == "confound_correction_datasink"
         )
         for source_dir in source_dirs:
@@ -889,6 +974,10 @@ def move_cleaned_timeseries(subjects: list[str], results_dir: Path) -> tuple[lis
 
 def _shell_command(arguments: list[str]) -> str:
     return shlex.join(arguments)
+
+
+def _log_generated_script(script_path: Path, script: str) -> None:
+    logger.info("Generated script: %s\n%s", script_path, script)
 
 
 def _expand_template_paths(arguments: str, templates: dict[str, str]) -> str:
@@ -976,12 +1065,38 @@ def generate_subject_script(
     preprocess = output_dir / "func_preprocess" / subject / session_name
     confound = output_dir / "func_confound" / subject / session_name
     analysis = output_dir / "func_analysis" / subject / session_name
-    result_subject = results_dir / subject
-    result_session = result_subject / session_name
-    session_archive = result_session / "input_bids"
-    preprocess_archive = result_session / "preprocess"
-    confound_archive = result_session / "confound"
-    analysis_archive = result_session / "analysis"
+    subject_archive_root = results_dir / SINGLE_SUBJECT_OUTPUT_DIR
+    session_archive = (
+        subject_archive_root / "tmp_bids_session" / subject / session_name
+    )
+    preprocess_archive = (
+        subject_archive_root / "func_preprocess" / subject / session_name
+    )
+    confound_archive = (
+        subject_archive_root / "func_confound" / subject / session_name
+    )
+    analysis_archive = (
+        subject_archive_root / "func_analysis" / subject / session_name
+    )
+    legacy_session_archive = results_dir / subject / session_name
+    if pipeline == "analysis_only" and archive_outputs:
+        legacy_archives = (
+            ("preprocess", preprocess_archive, legacy_session_archive / "preprocess"),
+            ("confound_correction", confound_archive, legacy_session_archive / "confound"),
+        )
+        for stage, archive_path, legacy_path in legacy_archives:
+            if (
+                not _workflow_path(archive_path, stage).is_file()
+                and _workflow_path(legacy_path, stage).is_file()
+            ):
+                if stage == "preprocess":
+                    preprocess_archive = legacy_path
+                elif stage == "confound_correction":
+                    confound_archive = legacy_path
+        if not session_archive.is_dir() and (
+            legacy_session_archive / "input_bids"
+        ).is_dir():
+            session_archive = legacy_session_archive / "input_bids"
     templates = {
         "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
         "brain_mask": "/templates/anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
@@ -1138,11 +1253,9 @@ def generate_subject_script(
     confound_workflow = _workflow_path(confound, "confound_correction")
     confound_cli = confound / "rabies_confound_correction.pkl"
     analysis_workflow = _workflow_path(analysis, "analysis")
-    legacy_analysis_marker = analysis_archive / subject / "rabies_analysis.pkl"
-    lines.extend([
-        "",
-        f"result_session={shlex.quote(str(result_session))}",
-    ])
+    legacy_analysis_marker = (
+        legacy_session_archive / "analysis" / subject / "rabies_analysis.pkl"
+    )
     if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.extend([
             *(
@@ -1167,7 +1280,8 @@ def generate_subject_script(
                 [
                     f"if [[ \"$preprocess\" != {shlex.quote(str(preprocess_archive))} ]]; then",
                     f"  mkdir -p {shlex.quote(str(preprocess_archive))}",
-                    f"  cp -a \"$preprocess/\". {shlex.quote(str(preprocess_archive))}/",
+                    f"  echo \"Archiving preprocessing output to {preprocess_archive}\"",
+                    f"  cp -av \"$preprocess/\". {shlex.quote(str(preprocess_archive))}/",
                     "fi",
                 ]
                 if archive_outputs
@@ -1193,7 +1307,8 @@ def generate_subject_script(
                     f"  cp -f {shlex.quote(str(preprocess_workflow))} {shlex.quote(str(preprocess_archive))}/",
                     "fi",
                     f"if [[ -d {shlex.quote(str(preprocess))} ]]; then",
-                    f"  cp -a {shlex.quote(str(preprocess))}/. {shlex.quote(str(preprocess_archive))}/",
+                    f"  echo \"Archiving preprocessing output to {preprocess_archive}\"",
+                    f"  cp -av {shlex.quote(str(preprocess))}/. {shlex.quote(str(preprocess_archive))}/",
                     "fi",
                 ]
                 if archive_outputs
@@ -1212,7 +1327,8 @@ def generate_subject_script(
                     f"    {_shell_command(confound_command)}",
                     "  fi",
                     f"  mkdir -p {shlex.quote(str(confound_archive))}",
-                    f"  cp -a {shlex.quote(str(confound))}/. {shlex.quote(str(confound_archive))}/",
+                    f"  echo \"Archiving confound output to {confound_archive}\"",
+                    f"  cp -av {shlex.quote(str(confound))}/. {shlex.quote(str(confound_archive))}/",
                     "fi",
                 ]
                 if archive_outputs
@@ -1313,7 +1429,8 @@ def generate_subject_script(
                 f"    {_shell_command(analysis_command)}",
                 "  fi",
                 f"  mkdir -p {shlex.quote(str(analysis_archive))}",
-                f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
+                f"  echo \"Archiving analysis output to {analysis_archive}\"",
+                f"  cp -av \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
                 "fi",
             ])
         else:
@@ -1325,7 +1442,8 @@ def generate_subject_script(
     if archive_outputs and pipeline not in {"fixrabies_prepare_only", "analysis_only"}:
         lines.extend([
             'mkdir -p "$session_archive"',
-            'cp -a "$bids/." "$session_archive/"',
+            'echo "Archiving session BIDS input to $session_archive"',
+            'cp -av "$bids/." "$session_archive/"',
         ])
     if archive_outputs:
         lines.extend([
@@ -1334,7 +1452,10 @@ def generate_subject_script(
             '    echo "Refusing to delete symlinked RABIES output: $rabies_output" >&2',
             "    exit 1",
             "  fi",
-            '  if [[ -d "$rabies_output" ]]; then rm -rf -- "$rabies_output"; fi',
+            '  if [[ -d "$rabies_output" ]]; then',
+            '    echo "Removing working output after archive: $rabies_output"',
+            '    rm -rf -- "$rabies_output"',
+            "  fi",
             "done",
         ])
     lines.extend(['echo "Finished subject $subject"', ""])
@@ -1392,7 +1513,11 @@ def clear_cohort_output(output_dir: Path) -> int:
     return 0
 
 
-def _copy_archive_directory(source: Path, destination: Path) -> bool:
+def _copy_archive_directory(
+    source: Path,
+    destination: Path,
+    progress: Callable[[str], None] | None = None,
+) -> bool:
     if source.is_symlink():
         raise ValueError(f"Refusing to archive symlinked working output: {source}")
     if not source.is_dir():
@@ -1402,7 +1527,38 @@ def _copy_archive_directory(source: Path, destination: Path) -> bool:
     ):
         raise ValueError(f"Archive destination is not a directory: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+    copied_files = 0
+    if progress is not None:
+        progress(f"Copying {source} to {destination}")
+
+    def copy_file(source_file: str, destination_file: str) -> str:
+        nonlocal copied_files
+        copied = shutil.copy2(source_file, destination_file)
+        copied_files += 1
+        if progress is not None and copied_files % 100 == 0:
+            progress(
+                f"Copied {copied_files} files from {source} to {destination}"
+            )
+        return copied
+
+    logger.info("Copying archive folder: %s -> %s", source, destination)
+    shutil.copytree(
+        source,
+        destination,
+        dirs_exist_ok=True,
+        symlinks=True,
+        copy_function=copy_file,
+    )
+    logger.info(
+        "Finished archive folder: %s -> %s (%s files)",
+        source,
+        destination,
+        copied_files,
+    )
+    if progress is not None:
+        progress(
+            f"Finished copying {source.name} ({copied_files} files)"
+        )
     return True
 
 
@@ -1427,6 +1583,7 @@ def archive_subject_outputs(
     output_dir: Path,
     results_dir: Path,
     sessions_by_subject: dict[str, list[str]] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """Copy existing per-session RABIES outputs into their results layout."""
     output_dir, results_dir = _validate_archive_roots(output_dir, results_dir)
@@ -1441,15 +1598,18 @@ def archive_subject_outputs(
             f"Refusing to archive symlinked working output: {working_root}"
         )
     stages = (
-        ("tmp_bids_session", "input_bids"),
-        ("func_preprocess", "preprocess"),
-        ("func_confound", "confound"),
-        ("func_analysis", "analysis"),
+        "tmp_bids_session",
+        "func_preprocess",
+        "func_confound",
+        "func_analysis",
     )
+    archive_root = results_dir / SINGLE_SUBJECT_OUTPUT_DIR
     archived: list[Path] = []
     for subject in subjects:
+        if progress is not None:
+            progress(f"Checking working output for {subject}")
         subject_stage_dirs = [
-            working_root / source_name / subject for source_name, _ in stages
+            working_root / stage / subject for stage in stages
         ]
         for stage_dir in subject_stage_dirs:
             if stage_dir.is_symlink():
@@ -1480,24 +1640,29 @@ def archive_subject_outputs(
             )
 
         for session_name in sorted(session_names):
-            for (source_name, archive_name), stage_dir in zip(
-                stages, subject_stage_dirs
-            ):
+            for stage, stage_dir in zip(stages, subject_stage_dirs):
                 source = stage_dir / session_name
-                destination = results_dir / subject / session_name / archive_name
+                destination = archive_root / stage / subject / session_name
                 if (
-                    (results_dir / subject).is_symlink()
-                    or (results_dir / subject / session_name).is_symlink()
+                    archive_root.is_symlink()
+                    or (archive_root / stage).is_symlink()
+                    or (archive_root / stage / subject).is_symlink()
+                    or (archive_root / stage / subject / session_name).is_symlink()
                 ):
                     raise ValueError(
                         f"Refusing to archive through a symlink: {destination}"
                     )
-                if _copy_archive_directory(source, destination):
+                if _copy_archive_directory(source, destination, progress):
                     archived.append(destination)
+    logger.info("Archived %s subject output folder(s)", len(archived))
     return archived
 
 
-def archive_cohort_outputs(output_dir: Path, results_dir: Path) -> list[Path]:
+def archive_cohort_outputs(
+    output_dir: Path,
+    results_dir: Path,
+    progress: Callable[[str], None] | None = None,
+) -> list[Path]:
     """Copy existing cohort RABIES/FIXRABIES outputs into cohort results."""
     output_dir, results_dir = _validate_archive_roots(output_dir, results_dir)
     cohort_output = output_dir / "cohort"
@@ -1513,9 +1678,51 @@ def archive_cohort_outputs(output_dir: Path, results_dir: Path) -> list[Path]:
             )
         if cohort_results.is_symlink() or destination.is_symlink():
             raise ValueError(f"Refusing to archive through a symlink: {destination}")
-        if _copy_archive_directory(source, destination):
+        if _copy_archive_directory(source, destination, progress):
             archived.append(destination)
+    logger.info("Archived %s cohort output folder(s)", len(archived))
     return archived
+
+
+class ArchiveWorker(QObject):
+    progress = Signal(str)
+    succeeded = Signal(list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        cohort_mode: bool,
+        output_dir: Path,
+        results_dir: Path,
+        subjects: list[str],
+        sessions_by_subject: dict[str, list[str]] | None,
+    ) -> None:
+        super().__init__()
+        self.cohort_mode = cohort_mode
+        self.output_dir = output_dir
+        self.results_dir = results_dir
+        self.subjects = subjects
+        self.sessions_by_subject = sessions_by_subject
+
+    def run(self) -> None:
+        try:
+            if self.cohort_mode:
+                archived = archive_cohort_outputs(
+                    self.output_dir, self.results_dir, self.progress.emit
+                )
+            else:
+                archived = archive_subject_outputs(
+                    self.subjects,
+                    self.output_dir,
+                    self.results_dir,
+                    self.sessions_by_subject,
+                    self.progress.emit,
+                )
+        except Exception as error:
+            logger.exception("Manual archive failed")
+            self.failed.emit(f"{type(error).__name__}: {error}")
+        else:
+            self.succeeded.emit(archived)
 
 
 def generate_cohort_script(
@@ -1705,7 +1912,8 @@ def generate_cohort_script(
             *(
                 [
                     'mkdir -p "$preprocess_archive"',
-                    'cp -a "$preprocess/." "$preprocess_archive/"',
+                    'echo "Archiving cohort preprocessing output to $preprocess_archive"',
+                    'cp -av "$preprocess/." "$preprocess_archive/"',
                 ]
                 if archive_outputs
                 else []
@@ -1736,7 +1944,8 @@ def generate_cohort_script(
             *(
                 [
                     'mkdir -p "$confound_archive"',
-                    'cp -a "$confound/." "$confound_archive/"',
+                    'echo "Archiving cohort confound output to $confound_archive"',
+                    'cp -av "$confound/." "$confound_archive/"',
                 ]
                 if archive_outputs
                 else []
@@ -1791,7 +2000,8 @@ def generate_cohort_script(
             *(
                 [
                     'mkdir -p "$analysis_archive"',
-                    'cp -a "$analysis/." "$analysis_archive/"',
+                    'echo "Archiving cohort analysis output to $analysis_archive"',
+                    'cp -av "$analysis/." "$analysis_archive/"',
                 ]
                 if archive_outputs
                 else []
@@ -1825,7 +2035,8 @@ def generate_cohort_script(
             *(
                 [
                     'mkdir -p "$fix_archive"',
-                    'cp -a "$fix_dir/." "$fix_archive/"',
+                    'echo "Archiving cohort FIXRABIES output to $fix_archive"',
+                    'cp -av "$fix_dir/." "$fix_archive/"',
                 ]
                 if archive_outputs
                 else []
@@ -1838,7 +2049,10 @@ def generate_cohort_script(
             '  echo "Refusing to delete symlinked cohort working output: $cohort" >&2',
             "  exit 1",
             "fi",
-            'if [[ -d "$cohort" ]]; then rm -rf -- "$cohort"; fi',
+            'if [[ -d "$cohort" ]]; then',
+            '  echo "Removing cohort working output after archive: $cohort"',
+            '  rm -rf -- "$cohort"',
+            "fi",
         ])
     lines.append("")
     return "\n".join(lines)
@@ -2097,6 +2311,8 @@ class SubjectManager(QMainWindow):
             "Confound correction": CONFOUND_ARGS,
             "Analysis": ANALYSIS_ARGS,
         }
+        self._archive_thread: QThread | None = None
+        self._archive_worker: ArchiveWorker | None = None
         self._build_ui()
         self.update_project_label()
         self.refresh_subjects()
@@ -2221,7 +2437,6 @@ class SubjectManager(QMainWindow):
             ("Refresh subjects", self.refresh_subjects),
             ("Select all", self.select_all),
             ("Clear selection", self.clear_selection),
-            ("Archive existing output", self.archive_existing_output),
             ("Move cleaned timeseries", self.move_selected_cleaned_timeseries),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("RABIES arguments…", self.edit_arguments),
@@ -2229,6 +2444,9 @@ class SubjectManager(QMainWindow):
             button = QPushButton(label)
             button.clicked.connect(callback)
             common_options.addWidget(button)
+        self.archive_button = QPushButton("Archive existing output")
+        self.archive_button.clicked.connect(self.archive_existing_output)
+        common_options.addWidget(self.archive_button)
         common_options.addStretch()
         layout.addLayout(common_options)
 
@@ -2691,11 +2909,27 @@ class SubjectManager(QMainWindow):
             rows = [(session, None, "No NIfTI files found") for session in sessions]
         self.session_details.setRowCount(len(rows))
         for row, (session, path, orientation) in enumerate(rows):
-            result_session = results / subject / _session_result_name(session)
+            result_session = results / SINGLE_SUBJECT_OUTPUT_DIR
+            archived_stage_dirs = (
+                "tmp_bids_session",
+                "func_preprocess",
+                "func_confound",
+                "func_analysis",
+            )
             archive = (
                 "Original BIDS"
                 if cohort_mode
-                else "Present" if result_session.is_dir() else "Not found"
+                else (
+                    "Present"
+                    if any(
+                        (
+                            result_session / stage / subject
+                            / _session_result_name(session)
+                        ).is_dir()
+                        for stage in archived_stage_dirs
+                    )
+                    else "Not found"
+                )
             )
             states = (
                 cohort_states
@@ -2895,7 +3129,13 @@ class SubjectManager(QMainWindow):
             )
             return
         if subjects is not None:
-            targets = [results / subject for subject in subjects]
+            targets = [
+                results / subject for subject in subjects
+            ] + [
+                results / SINGLE_SUBJECT_OUTPUT_DIR / stage / subject
+                for stage in SUBJECT_ARCHIVE_DIRECTORIES
+                for subject in subjects
+            ]
         else:
             targets = list(results.iterdir()) if results.is_dir() else []
         existing = [path for path in targets if path.exists() or path.is_symlink()]
@@ -2986,6 +3226,9 @@ class SubjectManager(QMainWindow):
         )
 
     def archive_existing_output(self) -> None:
+        if self._archive_thread is not None:
+            logger.warning("Manual archive requested while another archive is active")
+            return
         output_value = self.path_fields["output"].text().strip()
         results_value = self.path_fields["results"].text().strip()
         if not output_value or not results_value:
@@ -3039,37 +3282,72 @@ class SubjectManager(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        try:
-            archived = (
-                archive_cohort_outputs(output, results)
-                if cohort_mode
-                else archive_subject_outputs(
-                    subjects,
-                    output,
-                    results,
-                    sessions_by_subject,
-                )
-            )
-        except (OSError, ValueError) as error:
-            QMessageBox.critical(
-                self, "Could not archive working output", str(error)
-            )
-            return
+        logger.info(
+            "Starting manual %s archive: output=%s results=%s subjects=%s sessions=%s",
+            "cohort" if cohort_mode else "single-subject",
+            output,
+            results,
+            subjects if not cohort_mode else "all",
+            sessions_by_subject or "all available",
+        )
+        self.archive_button.setEnabled(False)
+        self.status.setText("Starting archive; working output will be kept.")
+        thread = QThread(self)
+        worker = ArchiveWorker(
+            cohort_mode, output, results,
+            [] if cohort_mode else subjects,
+            sessions_by_subject,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._archive_progress)
+        worker.succeeded.connect(self._archive_succeeded)
+        worker.failed.connect(self._archive_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._archive_thread_finished)
+        self._archive_thread = thread
+        self._archive_worker = worker
+        thread.start()
+
+    def _archive_progress(self, message: str) -> None:
+        logger.info("Archive progress: %s", message)
+        self.status.setText(message)
+
+    def _archive_succeeded(self, archived: list[Path]) -> None:
+        self.archive_button.setEnabled(True)
         if not archived:
             QMessageBox.information(
                 self,
                 "No RABIES output found",
-                f"No existing working output was found to archive in {output}.",
+                "No existing working output was found to archive.",
             )
+            logger.info("Manual archive finished: no working output was found")
+            self.status.setText("No existing working output was found.")
             return
 
         self.refresh_subjects()
-        if cohort_mode:
+        if self.mode_selector.currentData() == "cohort":
             self._refresh_cohort_status()
+        logger.info("Manual archive completed: %s folder(s)", len(archived))
         self.status.setText(
-            f"Archived {len(archived)} existing output folder(s) to {results}; "
+            f"Archived {len(archived)} existing output folder(s); "
             "working output was kept."
         )
+
+    def _archive_failed(self, error: str) -> None:
+        self.archive_button.setEnabled(True)
+        logger.error("Manual archive failed: %s", error)
+        self.status.setText("Archiving failed.")
+        QMessageBox.critical(
+            self, "Could not archive working output", error
+        )
+
+    def _archive_thread_finished(self) -> None:
+        self._archive_thread = None
+        self._archive_worker = None
 
     def move_selected_cleaned_timeseries(self) -> None:
         selected = self._selected_subjects()
@@ -3316,8 +3594,10 @@ class SubjectManager(QMainWindow):
             script_path.parent.mkdir(parents=True, exist_ok=True)
             script_path.write_text(script, encoding="utf-8")
             script_path.chmod(0o755)
+            _log_generated_script(script_path, script)
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create cohort script", str(error))
+            logger.exception("Could not create cohort script")
             return
         self.status.setText(
             f"Created {pipeline_label} cohort script for {len(subjects)} "
@@ -3428,20 +3708,30 @@ class SubjectManager(QMainWindow):
         )
         if confirmation != QMessageBox.StandardButton.Yes:
             return
+        command = ["sbatch", str(script_path)]
+        logger.info("Executing command: %s", shlex.join(command))
         try:
             result = subprocess.run(
-                ["sbatch", str(script_path)],
+                command,
                 check=True,
                 capture_output=True,
                 text=True,
             )
         except (OSError, subprocess.CalledProcessError) as error:
             details = getattr(error, "stderr", None) or str(error)
+            logger.exception("Cohort sbatch submission failed")
+            if getattr(error, "stdout", None):
+                logger.info("sbatch stdout:\n%s", error.stdout)
+            if getattr(error, "stderr", None):
+                logger.error("sbatch stderr:\n%s", error.stderr)
             QMessageBox.critical(
                 self, "Submission failed",
                 f"Could not submit the cohort job.\n{details}",
             )
             return
+        logger.info("sbatch stdout:\n%s", result.stdout.strip())
+        if result.stderr.strip():
+            logger.info("sbatch stderr:\n%s", result.stderr.strip())
         submitted = result.stdout.strip() or str(script_path)
         self.status.setText("Submitted one cohort job with sbatch.")
         QMessageBox.information(self, "Cohort job submitted", submitted)
@@ -3618,6 +3908,9 @@ class SubjectManager(QMainWindow):
                                 / "func_preprocess" / subject / session_name,
                                 "preprocess",
                             ),
+                            _workflow_path(_subject_archive_stage(
+                                results, "func_preprocess", subject, session_name
+                            ), "preprocess"),
                             _workflow_path(
                                 results / subject / session_name / "preprocess",
                                 "preprocess",
@@ -3632,22 +3925,40 @@ class SubjectManager(QMainWindow):
                             )
                     elif pipeline == "analysis_only":
                         session_results = results / subject / session_name
+                        archived_preprocess = _subject_archive_stage(
+                            results, "func_preprocess", subject, session_name
+                        )
+                        archived_confound = _subject_archive_stage(
+                            results, "func_confound", subject, session_name
+                        )
+                        archived_input_bids = _subject_archive_stage(
+                            results, "tmp_bids_session", subject, session_name
+                        )
                         if self.archive_outputs.isChecked():
-                            preprocess_sources = (session_results / "preprocess",)
-                            confound_sources = (session_results / "confound",)
+                            preprocess_sources = (
+                                archived_preprocess,
+                                session_results / "preprocess",
+                            )
+                            confound_sources = (
+                                archived_confound,
+                                session_results / "confound",
+                            )
                             input_available = (
-                                session_results / "input_bids"
-                            ).is_dir()
+                                archived_input_bids.is_dir()
+                                or (session_results / "input_bids").is_dir()
+                            )
                         else:
                             session_output = output / SINGLE_SUBJECT_OUTPUT_DIR
                             preprocess_sources = (
                                 session_output / "func_preprocess" / subject
                                 / session_name,
+                                archived_preprocess,
                                 session_results / "preprocess",
                             )
                             confound_sources = (
                                 session_output / "func_confound" / subject
                                 / session_name,
+                                archived_confound,
                                 session_results / "confound",
                             )
                             input_available = True
@@ -3712,6 +4023,7 @@ class SubjectManager(QMainWindow):
                 script_path.parent.mkdir(parents=True, exist_ok=True)
                 script_path.write_text(script, encoding="utf-8")
                 script_path.chmod(0o755)
+                _log_generated_script(script_path, script)
             if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
                 for row in range(self.subjects.rowCount()):
                     subject_item = self.subjects.item(row, 0)
@@ -3740,6 +4052,7 @@ class SubjectManager(QMainWindow):
                     )
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Could not create scripts", str(error))
+            logger.exception("Could not create session scripts")
             return
         self.status.setText(
             f"Created {pipeline_label} scripts for {len(selected)} subject(s) "
@@ -3907,12 +4220,22 @@ class SubjectManager(QMainWindow):
         submitted = []
         try:
             for path in script_paths:
+                command = ["sbatch", str(path)]
+                logger.info("Executing command: %s", shlex.join(command))
                 result = subprocess.run(
-                    ["sbatch", str(path)], check=True, capture_output=True, text=True
+                    command, check=True, capture_output=True, text=True
                 )
+                logger.info("sbatch stdout:\n%s", result.stdout.strip())
+                if result.stderr.strip():
+                    logger.info("sbatch stderr:\n%s", result.stderr.strip())
                 submitted.append(result.stdout.strip() or str(path))
         except (OSError, subprocess.CalledProcessError) as error:
             details = getattr(error, "stderr", None) or str(error)
+            logger.exception("Session sbatch submission failed")
+            if getattr(error, "stdout", None):
+                logger.info("sbatch stdout:\n%s", error.stdout)
+            if getattr(error, "stderr", None):
+                logger.error("sbatch stderr:\n%s", error.stderr)
             QMessageBox.critical(
                 self,
                 "Submission failed",
@@ -3932,7 +4255,25 @@ class SubjectManager(QMainWindow):
         )
 
 
+def _configure_terminal_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
 def main_subject_manager() -> None:
+    _configure_terminal_logging()
+    logger.info(
+        "Starting RABIES GUI with Python %s from %s (working directory: %s)",
+        sys.version.split()[0],
+        sys.executable,
+        Path.cwd(),
+    )
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     app = QApplication([])
     configure_dark_mode(app)
