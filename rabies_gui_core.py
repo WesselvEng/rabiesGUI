@@ -938,7 +938,7 @@ def generate_subject_script(
     pipeline: str = "whole_pipeline",
     fix_species: str = "ratSIGMA",
     fix_dir: Path | None = None,
-    delete_output_after_archive: bool = True,
+    archive_outputs: bool = True,
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
@@ -1014,27 +1014,33 @@ def generate_subject_script(
         "/preprocess_outputs/", "/confound_correction_outputs/",
     ] + shlex.split(confound_args)
     analysis_confound_source = (
-        confound_archive if pipeline == "analysis_only" else confound
+        confound_archive if pipeline == "analysis_only" and archive_outputs
+        else confound
     )
-    analysis_bids_source = session_archive if pipeline == "analysis_only" else bids
+    analysis_bids_source = (
+        session_archive if pipeline == "analysis_only" and archive_outputs
+        else bids
+    )
     analysis_preprocess_source = (
-        preprocess_archive if pipeline == "analysis_only" else preprocess
+        preprocess_archive
+        if pipeline == "analysis_only" and archive_outputs
+        else preprocess
     )
     analysis_command = command_base + [
         "-B", bind(
             analysis_bids_source,
             "/input_bids",
-            pipeline == "analysis_only",
+            pipeline == "analysis_only" and archive_outputs,
         ),
         "-B", bind(
             analysis_preprocess_source,
             "/preprocess_outputs",
-            pipeline == "analysis_only",
+            pipeline == "analysis_only" and archive_outputs,
         ),
         "-B", bind(
             analysis_confound_source,
             "/confound_correction_outputs",
-            pipeline == "analysis_only",
+            pipeline == "analysis_only" and archive_outputs,
         ),
         "-B", bind(analysis, "/analysis_outputs"),
         "-B", bind(templates_dir, "/templates", True),
@@ -1102,7 +1108,9 @@ def generate_subject_script(
         f"confound_archive={shlex.quote(str(confound_archive))}",
         f"analysis_archive={shlex.quote(str(analysis_archive))}",
     ]
-    if pipeline not in {"fixrabies_prepare_only", "analysis_only"}:
+    if pipeline != "fixrabies_prepare_only" and (
+        pipeline != "analysis_only" or not archive_outputs
+    ):
         lines.extend([
             'mkdir -p "$bids_parent" "$preprocess"',
             'bids_staging=$(mktemp -d "$bids_parent/.${session_name}.XXXXXX")',
@@ -1137,11 +1145,17 @@ def generate_subject_script(
     ])
     if pipeline in {"whole_pipeline", "analysis_only"}:
         lines.extend([
-            f"if [[ -d {shlex.quote(str(analysis_archive))} "
-            f"&& -n \"$(find {shlex.quote(str(analysis_archive))} -mindepth 1 -maxdepth 1 -print -quit)\" ]]; then",
-            '  echo "Refusing to analyze $subject session $session_name: previous analysis results exist. Clear this session\'s results in the GUI first." >&2',
-            "  exit 1",
-            "fi",
+            *(
+                [
+                    f"if [[ -d {shlex.quote(str(analysis_archive))} "
+                    f"&& -n \"$(find {shlex.quote(str(analysis_archive))} -mindepth 1 -maxdepth 1 -print -quit)\" ]]; then",
+                    '  echo "Refusing to analyze $subject session $session_name: previous analysis results exist. Clear this session\'s results in the GUI first." >&2',
+                    "  exit 1",
+                    "fi",
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     if pipeline == "fixrabies_prepare_only":
         lines.extend([
@@ -1149,10 +1163,16 @@ def generate_subject_script(
             f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
             f"  preprocess={shlex.quote(str(preprocess_archive))}",
             "fi",
-            f"if [[ \"$preprocess\" != {shlex.quote(str(preprocess_archive))} ]]; then",
-            f"  mkdir -p {shlex.quote(str(preprocess_archive))}",
-            f"  cp -a \"$preprocess/\". {shlex.quote(str(preprocess_archive))}/",
-            "fi",
+            *(
+                [
+                    f"if [[ \"$preprocess\" != {shlex.quote(str(preprocess_archive))} ]]; then",
+                    f"  mkdir -p {shlex.quote(str(preprocess_archive))}",
+                    f"  cp -a \"$preprocess/\". {shlex.quote(str(preprocess_archive))}/",
+                    "fi",
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     if pipeline == "fixrabies_prepare_only":
         lines.extend([
@@ -1166,26 +1186,43 @@ def generate_subject_script(
             f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
             f"  {_shell_command(preprocess_command)}",
             "fi",
-            f"mkdir -p {shlex.quote(str(preprocess_archive))}",
-            f"if [[ -f {shlex.quote(str(preprocess_workflow))} ]]; then",
-            f"  cp -f {shlex.quote(str(preprocess_workflow))} {shlex.quote(str(preprocess_archive))}/",
-            "fi",
-            f"if [[ -d {shlex.quote(str(preprocess))} ]]; then",
-            f"  cp -a {shlex.quote(str(preprocess))}/. {shlex.quote(str(preprocess_archive))}/",
-            "fi",
+            *(
+                [
+                    f"mkdir -p {shlex.quote(str(preprocess_archive))}",
+                    f"if [[ -f {shlex.quote(str(preprocess_workflow))} ]]; then",
+                    f"  cp -f {shlex.quote(str(preprocess_workflow))} {shlex.quote(str(preprocess_archive))}/",
+                    "fi",
+                    f"if [[ -d {shlex.quote(str(preprocess))} ]]; then",
+                    f"  cp -a {shlex.quote(str(preprocess))}/. {shlex.quote(str(preprocess_archive))}/",
+                    "fi",
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     if pipeline in {"preproc_confound", "whole_pipeline"}:
         lines.extend([
             'mkdir -p "$confound"',
-            f"if [[ ! -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
-            f"|| ! -f {shlex.quote(str(confound_archive / confound_cli.name))} ]]; then",
-            f"  if [[ ! -f {shlex.quote(str(confound_workflow))} "
-            f"|| ! -f {shlex.quote(str(confound_cli))} ]]; then",
-            f"    {_shell_command(confound_command)}",
-            "  fi",
-            f"  mkdir -p {shlex.quote(str(confound_archive))}",
-            f"  cp -a {shlex.quote(str(confound))}/. {shlex.quote(str(confound_archive))}/",
-            "fi",
+            *(
+                [
+                    f"if [[ ! -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+                    f"|| ! -f {shlex.quote(str(confound_archive / confound_cli.name))} ]]; then",
+                    f"  if [[ ! -f {shlex.quote(str(confound_workflow))} "
+                    f"|| ! -f {shlex.quote(str(confound_cli))} ]]; then",
+                    f"    {_shell_command(confound_command)}",
+                    "  fi",
+                    f"  mkdir -p {shlex.quote(str(confound_archive))}",
+                    f"  cp -a {shlex.quote(str(confound))}/. {shlex.quote(str(confound_archive))}/",
+                    "fi",
+                ]
+                if archive_outputs
+                else [
+                    f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+                    f"|| ! -f {shlex.quote(str(confound_cli))} ]]; then",
+                    f"  {_shell_command(confound_command)}",
+                    "fi",
+                ]
+            ),
         ])
     if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         assert fix_dir is not None
@@ -1217,54 +1254,80 @@ def generate_subject_script(
             "fi",
         ])
     if pipeline == "analysis_only":
+        if not archive_outputs:
+            lines.extend([
+                f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+                f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+                f"  mkdir -p {shlex.quote(str(preprocess))}",
+                f"  cp -a {shlex.quote(str(preprocess_archive))}/. {shlex.quote(str(preprocess))}/",
+                "fi",
+                f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+                f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} ]]; then",
+                f"  mkdir -p {shlex.quote(str(confound))}",
+                f"  cp -a {shlex.quote(str(confound_archive))}/. {shlex.quote(str(confound))}/",
+                "fi",
+            ])
+        analysis_preprocess_workflow = (
+            archived_preprocess_workflow if archive_outputs else preprocess_workflow
+        )
+        analysis_confound_workflow = (
+            confound_archive / confound_workflow.name
+            if archive_outputs else confound_workflow
+        )
+        analysis_bids_source = session_archive if archive_outputs else bids
+        analysis_confound_source = confound_archive if archive_outputs else confound
         cleaned_timeseries = (
-            confound_archive
+            analysis_confound_source
             / "confound_correction_datasink"
             / "cleaned_timeseries"
         )
         lines.extend([
-            f"if [[ ! -f {shlex.quote(str(archived_preprocess_workflow))} "
-            f"|| ! -d {shlex.quote(str(session_archive))} "
-            f"|| ! -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+            f"if [[ ! -f {shlex.quote(str(analysis_preprocess_workflow))} "
+            f"|| ! -d {shlex.quote(str(analysis_bids_source))} "
+            f"|| ! -f {shlex.quote(str(analysis_confound_workflow))} "
             f"|| ! -d {shlex.quote(str(cleaned_timeseries))} "
             f"|| -z \"$(find {shlex.quote(str(cleaned_timeseries))} "
             "-type f -name '*_cleaned.nii.gz' -print -quit)\" ]]; then",
-            '  echo "Archived confound-correction cleaned timeseries are missing for $subject session $session_name; run confound correction first and keep its cleaned_timeseries folder intact." >&2',
+            '  echo "Confound-correction cleaned timeseries or required preprocessing inputs are missing for $subject session $session_name; run preprocessing and confound correction first." >&2',
             "  exit 1",
             "fi",
         ])
     if pipeline in {"whole_pipeline", "analysis_only"}:
-        lines.extend([
-            'mkdir -p "$analysis"',
-            *(
-                [
-                    f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
-                    f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
-                    f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
-                    f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
-                    f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
-                    f"  cp -f {shlex.quote(str(confound_archive / confound_workflow.name))} \"$confound/\"",
-                    f"  cp -f {shlex.quote(str(confound_archive / confound_cli.name))} \"$confound/\"",
-                    "fi",
-                ]
-                if pipeline == "whole_pipeline"
-                else []
-            ),
-            f"if [[ ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} "
-            f"&& ! -f {shlex.quote(str(legacy_analysis_marker))} ]]; then",
-            f"  if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
-            f"    {_shell_command(analysis_command)}",
-            "  fi",
-            f"  mkdir -p {shlex.quote(str(analysis_archive))}",
-            f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
-            "fi",
-        ])
-    if pipeline not in {"fixrabies_prepare_only", "analysis_only"}:
+        lines.append('mkdir -p "$analysis"')
+        if pipeline == "whole_pipeline" and archive_outputs:
+            lines.extend([
+                f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+                f"&& -f {shlex.quote(str(confound_archive / confound_workflow.name))} "
+                f"&& -f {shlex.quote(str(confound_archive / confound_cli.name))} "
+                f"&& ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} ]]; then",
+                f"  cp -a {shlex.quote(str(confound_archive / 'confound_correction_datasink'))} \"$confound/\"",
+                f"  cp -f {shlex.quote(str(confound_archive / confound_workflow.name))} \"$confound/\"",
+                f"  cp -f {shlex.quote(str(confound_archive / confound_cli.name))} \"$confound/\"",
+                "fi",
+            ])
+        if archive_outputs:
+            lines.extend([
+                f"if [[ ! -f {shlex.quote(str(analysis_archive / analysis_workflow.name))} "
+                f"&& ! -f {shlex.quote(str(legacy_analysis_marker))} ]]; then",
+                f"  if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
+                f"    {_shell_command(analysis_command)}",
+                "  fi",
+                f"  mkdir -p {shlex.quote(str(analysis_archive))}",
+                f"  cp -a \"$analysis/\". {shlex.quote(str(analysis_archive))}/",
+                "fi",
+            ])
+        else:
+            lines.extend([
+                f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
+                f"  {_shell_command(analysis_command)}",
+                "fi",
+            ])
+    if archive_outputs and pipeline not in {"fixrabies_prepare_only", "analysis_only"}:
         lines.extend([
             'mkdir -p "$session_archive"',
             'cp -a "$bids/." "$session_archive/"',
         ])
-    if delete_output_after_archive:
+    if archive_outputs:
         lines.extend([
             'for rabies_output in "$bids" "$preprocess_output" "$confound" "$analysis"; do',
             '  if [[ -L "$rabies_output" ]]; then',
@@ -1329,6 +1392,132 @@ def clear_cohort_output(output_dir: Path) -> int:
     return 0
 
 
+def _copy_archive_directory(source: Path, destination: Path) -> bool:
+    if source.is_symlink():
+        raise ValueError(f"Refusing to archive symlinked working output: {source}")
+    if not source.is_dir():
+        return False
+    if destination.is_symlink() or (
+        destination.exists() and not destination.is_dir()
+    ):
+        raise ValueError(f"Archive destination is not a directory: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+    return True
+
+
+def _validate_archive_roots(output_dir: Path, results_dir: Path) -> tuple[Path, Path]:
+    output_dir = output_dir.expanduser()
+    results_dir = results_dir.expanduser()
+    if output_dir.is_symlink() or results_dir.is_symlink():
+        raise ValueError("The output and results directories cannot be symlinks.")
+    output_dir = output_dir.resolve()
+    results_dir = results_dir.resolve()
+    if (
+        output_dir == results_dir
+        or output_dir in results_dir.parents
+        or results_dir in output_dir.parents
+    ):
+        raise ValueError("The output and results directories must be separate.")
+    return output_dir, results_dir
+
+
+def archive_subject_outputs(
+    subjects: list[str],
+    output_dir: Path,
+    results_dir: Path,
+    sessions_by_subject: dict[str, list[str]] | None = None,
+) -> list[Path]:
+    """Copy existing per-session RABIES outputs into their results layout."""
+    output_dir, results_dir = _validate_archive_roots(output_dir, results_dir)
+
+    for subject in subjects:
+        if not subject or Path(subject).name != subject or subject in {".", ".."}:
+            raise ValueError(f"Invalid subject directory name: {subject!r}")
+
+    working_root = output_dir / SINGLE_SUBJECT_OUTPUT_DIR
+    if working_root.is_symlink():
+        raise ValueError(
+            f"Refusing to archive symlinked working output: {working_root}"
+        )
+    stages = (
+        ("tmp_bids_session", "input_bids"),
+        ("func_preprocess", "preprocess"),
+        ("func_confound", "confound"),
+        ("func_analysis", "analysis"),
+    )
+    archived: list[Path] = []
+    for subject in subjects:
+        subject_stage_dirs = [
+            working_root / source_name / subject for source_name, _ in stages
+        ]
+        for stage_dir in subject_stage_dirs:
+            if stage_dir.is_symlink():
+                raise ValueError(
+                    f"Refusing to archive symlinked working output: {stage_dir}"
+                )
+        session_names = {
+            entry.name
+            for stage_dir in subject_stage_dirs
+            if stage_dir.is_dir() and not stage_dir.is_symlink()
+            for entry in stage_dir.iterdir()
+            if entry.is_dir()
+        }
+        for stage_dir in subject_stage_dirs:
+            if stage_dir.is_dir():
+                for entry in stage_dir.iterdir():
+                    if entry.is_symlink():
+                        raise ValueError(
+                            "Refusing to archive symlinked working output: "
+                            f"{entry}"
+                        )
+        if sessions_by_subject is not None:
+            selected_sessions = sessions_by_subject.get(subject, [])
+            for session in selected_sessions:
+                _session_result_name(session)
+            session_names.intersection_update(
+                _session_result_name(session) for session in selected_sessions
+            )
+
+        for session_name in sorted(session_names):
+            for (source_name, archive_name), stage_dir in zip(
+                stages, subject_stage_dirs
+            ):
+                source = stage_dir / session_name
+                destination = results_dir / subject / session_name / archive_name
+                if (
+                    (results_dir / subject).is_symlink()
+                    or (results_dir / subject / session_name).is_symlink()
+                ):
+                    raise ValueError(
+                        f"Refusing to archive through a symlink: {destination}"
+                    )
+                if _copy_archive_directory(source, destination):
+                    archived.append(destination)
+    return archived
+
+
+def archive_cohort_outputs(output_dir: Path, results_dir: Path) -> list[Path]:
+    """Copy existing cohort RABIES/FIXRABIES outputs into cohort results."""
+    output_dir, results_dir = _validate_archive_roots(output_dir, results_dir)
+    cohort_output = output_dir / "cohort"
+    cohort_results = results_dir / "cohort"
+    stages = ("preprocess", "confound", "analysis", "fixrabies")
+    archived = []
+    for stage in stages:
+        source = cohort_output / stage
+        destination = cohort_results / stage
+        if source.is_symlink() or (cohort_output.is_symlink()):
+            raise ValueError(
+                f"Refusing to archive symlinked working output: {source}"
+            )
+        if cohort_results.is_symlink() or destination.is_symlink():
+            raise ValueError(f"Refusing to archive through a symlink: {destination}")
+        if _copy_archive_directory(source, destination):
+            archived.append(destination)
+    return archived
+
+
 def generate_cohort_script(
     bids_dir: Path,
     results_dir: Path,
@@ -1341,7 +1530,7 @@ def generate_cohort_script(
     fix_species: str = "ratSIGMA",
     subject_prefix: str = "sub-",
     output_dir: Path | None = None,
-    delete_output_after_archive: bool = True,
+    archive_outputs: bool = True,
 ) -> str:
     """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
@@ -1417,10 +1606,14 @@ def generate_cohort_script(
         "/preprocess_outputs/", "/confound_correction_outputs/",
     ] + shlex.split(confound_args)
     analysis_confound_source = (
-        confound_archive if pipeline == "analysis_only" else confound
+        confound_archive
+        if pipeline == "analysis_only" and archive_outputs
+        else confound
     )
     analysis_preprocess_source = (
-        preprocess_archive if pipeline == "analysis_only" else preprocess
+        preprocess_archive
+        if pipeline == "analysis_only" and archive_outputs
+        else preprocess
     )
     analysis_command = command_base + [
         "-B", bind(bids_dir, "/input_bids", True),
@@ -1428,7 +1621,7 @@ def generate_cohort_script(
         "-B", bind(
             analysis_confound_source,
             "/confound_correction_outputs",
-            pipeline == "analysis_only",
+            pipeline == "analysis_only" and archive_outputs,
         ),
         "-B", bind(analysis, "/analysis_outputs"),
         "-B", bind(templates_dir, "/templates", True),
@@ -1470,7 +1663,11 @@ def generate_cohort_script(
         f"fix_dir={shlex.quote(str(fix_dir))}",
         f"fix_archive={shlex.quote(str(fix_archive))}",
         f"bids_source={shlex.quote(str(bids_dir))}",
-        'for output_path in "$cohort" "$cohort_archive"; do',
+        (
+            'for output_path in "$cohort" "$cohort_archive"; do'
+            if archive_outputs
+            else 'for output_path in "$cohort"; do'
+        ),
         '  if [[ -L "$output_path" ]]; then',
         '    echo "Refusing to use symlinked cohort output path: $output_path" >&2',
         "    exit 1",
@@ -1480,7 +1677,11 @@ def generate_cohort_script(
         '  echo "BIDS input directory not found: $bids_source" >&2',
         "  exit 1",
         "fi",
-        'mkdir -p "$cohort" "$cohort_archive"',
+        (
+            'mkdir -p "$cohort" "$cohort_archive"'
+            if archive_outputs
+            else 'mkdir -p "$cohort"'
+        ),
         f"echo {shlex.quote(f'Running RABIES on {len(subjects)} subjects from {bids_dir}')}",
     ]
     if pipeline not in {"analysis_only", "fixrabies_prepare_only"}:
@@ -1501,8 +1702,14 @@ def generate_cohort_script(
             f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} ]]; then",
             "  " + _shell_command(preprocess_command),
             "fi",
-            'mkdir -p "$preprocess_archive"',
-            'cp -a "$preprocess/." "$preprocess_archive/"',
+            *(
+                [
+                    'mkdir -p "$preprocess_archive"',
+                    'cp -a "$preprocess/." "$preprocess_archive/"',
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     if pipeline == "fixrabies_prepare_only":
         lines.extend([
@@ -1526,22 +1733,48 @@ def generate_cohort_script(
             f"if [[ ! -f {shlex.quote(str(confound_workflow))} ]]; then",
             "  " + _shell_command(confound_command),
             "fi",
-            'mkdir -p "$confound_archive"',
-            'cp -a "$confound/." "$confound_archive/"',
+            *(
+                [
+                    'mkdir -p "$confound_archive"',
+                    'cp -a "$confound/." "$confound_archive/"',
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     if pipeline == "analysis_only":
+        if not archive_outputs:
+            lines.extend([
+                f"if [[ ! -f {shlex.quote(str(preprocess_workflow))} "
+                f"&& -f {shlex.quote(str(archived_preprocess_workflow))} ]]; then",
+                '  mkdir -p "$preprocess"',
+                '  cp -a "$preprocess_archive/." "$preprocess/"',
+                "fi",
+                f"if [[ ! -f {shlex.quote(str(confound_workflow))} "
+                f"&& -f {shlex.quote(str(archived_confound_workflow))} ]]; then",
+                '  mkdir -p "$confound"',
+                '  cp -a "$confound_archive/." "$confound/"',
+                "fi",
+            ])
+        analysis_preprocess_workflow = (
+            archived_preprocess_workflow if archive_outputs else preprocess_workflow
+        )
+        analysis_confound_workflow = (
+            archived_confound_workflow if archive_outputs else confound_workflow
+        )
+        analysis_confound_source = confound_archive if archive_outputs else confound
         cleaned_timeseries = (
-            confound_archive
+            analysis_confound_source
             / "confound_correction_datasink"
             / "cleaned_timeseries"
         )
         lines.extend([
-            f"if [[ ! -f {shlex.quote(str(archived_preprocess_workflow))} "
-            f"|| ! -f {shlex.quote(str(archived_confound_workflow))} "
+            f"if [[ ! -f {shlex.quote(str(analysis_preprocess_workflow))} "
+            f"|| ! -f {shlex.quote(str(analysis_confound_workflow))} "
             f"|| ! -d {shlex.quote(str(cleaned_timeseries))} "
             f"|| -z \"$(find {shlex.quote(str(cleaned_timeseries))} "
             "-type f -name '*_cleaned.nii.gz' -print -quit)\" ]]; then",
-            '  echo "Archived cohort confound-correction cleaned timeseries are missing; run confound correction first and keep its cleaned_timeseries folder intact." >&2',
+            '  echo "Cohort confound-correction cleaned timeseries are missing; run confound correction first." >&2',
             "  exit 1",
             "fi",
         ])
@@ -1555,8 +1788,14 @@ def generate_cohort_script(
             f"if [[ ! -f {shlex.quote(str(analysis_workflow))} ]]; then",
             "  " + _shell_command(analysis_command),
             "fi",
-            'mkdir -p "$analysis_archive"',
-            'cp -a "$analysis/." "$analysis_archive/"',
+            *(
+                [
+                    'mkdir -p "$analysis_archive"',
+                    'cp -a "$analysis/." "$analysis_archive/"',
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         fix_data = fix_dir / "data"
@@ -1583,11 +1822,17 @@ def generate_cohort_script(
             "  " + _shell_command(fix_prepare_command),
             f"  touch {shlex.quote(str(fix_marker))}",
             "fi",
-            'mkdir -p "$fix_archive"',
-            'cp -a "$fix_dir/." "$fix_archive/"',
+            *(
+                [
+                    'mkdir -p "$fix_archive"',
+                    'cp -a "$fix_dir/." "$fix_archive/"',
+                ]
+                if archive_outputs
+                else []
+            ),
         ])
     lines.append(f'echo "Finished cohort {pipeline.replace("_", " ")}"')
-    if delete_output_after_archive:
+    if archive_outputs:
         lines.extend([
             'if [[ -L "$cohort" ]]; then',
             '  echo "Refusing to delete symlinked cohort working output: $cohort" >&2',
@@ -1976,6 +2221,7 @@ class SubjectManager(QMainWindow):
             ("Refresh subjects", self.refresh_subjects),
             ("Select all", self.select_all),
             ("Clear selection", self.clear_selection),
+            ("Archive existing output", self.archive_existing_output),
             ("Move cleaned timeseries", self.move_selected_cleaned_timeseries),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
             ("RABIES arguments…", self.edit_arguments),
@@ -1986,18 +2232,15 @@ class SubjectManager(QMainWindow):
         common_options.addStretch()
         layout.addLayout(common_options)
 
-        self.delete_output_after_archive = QCheckBox(
-            "Delete RABIES working outputs after archiving to rabies_results"
-        )
-        self.delete_output_after_archive.setChecked(True)
-        self.delete_output_after_archive.setToolTip(
-            "After a job archives its results, remove its working folders from "
-            "rabies_outputs/single-subject or rabies_outputs/cohort. Archived "
-            "results in rabies_results are kept. Uncheck to retain working "
-            "folders; remove them later with the workflow output cleanup buttons."
+        self.archive_outputs = QCheckBox("Archiving")
+        self.archive_outputs.setChecked(True)
+        self.archive_outputs.setToolTip(
+            "When checked, archive stage results to rabies_results and remove "
+            "the RABIES working outputs after a successful archive. When "
+            "unchecked, do not archive results and retain working outputs."
         )
         output_retention_options = QHBoxLayout()
-        output_retention_options.addWidget(self.delete_output_after_archive)
+        output_retention_options.addWidget(self.archive_outputs)
         output_retention_options.addStretch()
         layout.addLayout(output_retention_options)
 
@@ -2742,6 +2985,92 @@ class SubjectManager(QMainWindow):
             f"Removed {removed} subject-specific output folder(s) from {output}."
         )
 
+    def archive_existing_output(self) -> None:
+        output_value = self.path_fields["output"].text().strip()
+        results_value = self.path_fields["results"].text().strip()
+        if not output_value or not results_value:
+            QMessageBox.critical(
+                self,
+                "Output or results directory not set",
+                "Choose a project root or set both output and results directories.",
+            )
+            return
+
+        output = Path(output_value).expanduser()
+        results = Path(results_value).expanduser()
+        cohort_mode = self.mode_selector.currentData() == "cohort"
+        sessions_by_subject = None
+        if cohort_mode:
+            scope = f"existing cohort output from {output / 'cohort'}"
+        else:
+            subjects = self._selected_subjects()
+            if not subjects:
+                QMessageBox.information(
+                    self,
+                    "No subjects selected",
+                    "Select one or more subjects whose working output you want to archive.",
+                )
+                return
+            if len(subjects) == 1:
+                selected_sessions = sorted({
+                    item.text()
+                    for item in self.session_details.selectedItems()
+                    if item.column() == 0
+                })
+                if selected_sessions:
+                    sessions_by_subject = {subjects[0]: selected_sessions}
+            scope = (
+                f"existing output for {', '.join(subjects)}"
+                + (
+                    f", sessions {', '.join(sessions_by_subject[subjects[0]])}"
+                    if sessions_by_subject
+                    else " (all available sessions)"
+                )
+            )
+
+        answer = QMessageBox.question(
+            self,
+            "Archive existing RABIES output",
+            f"Copy {scope} to {results}?\n"
+            "Existing archived files with the same names may be replaced. "
+            "Working output will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            archived = (
+                archive_cohort_outputs(output, results)
+                if cohort_mode
+                else archive_subject_outputs(
+                    subjects,
+                    output,
+                    results,
+                    sessions_by_subject,
+                )
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, "Could not archive working output", str(error)
+            )
+            return
+        if not archived:
+            QMessageBox.information(
+                self,
+                "No RABIES output found",
+                f"No existing working output was found to archive in {output}.",
+            )
+            return
+
+        self.refresh_subjects()
+        if cohort_mode:
+            self._refresh_cohort_status()
+        self.status.setText(
+            f"Archived {len(archived)} existing output folder(s) to {results}; "
+            "working output was kept."
+        )
+
     def move_selected_cleaned_timeseries(self) -> None:
         selected = self._selected_subjects()
         if not selected:
@@ -2929,13 +3258,46 @@ class SubjectManager(QMainWindow):
                         "preprocessing first; checked: "
                         + ", ".join(str(path) for path in preprocess_locations)
                     )
-            elif pipeline == "analysis_only" and not _workflow_path(
-                results / "cohort" / "preprocess", "preprocess"
-            ).is_file():
-                raise ValueError(
-                    "Archived cohort preprocessing output is missing. Run "
-                    "preprocessing first."
+            elif pipeline == "analysis_only":
+                if self.archive_outputs.isChecked():
+                    preprocessing_dirs = (results / "cohort" / "preprocess",)
+                    confound_dirs = (results / "cohort" / "confound",)
+                else:
+                    preprocessing_dirs = (
+                        output / "cohort" / "preprocess",
+                        results / "cohort" / "preprocess",
+                    )
+                    confound_dirs = (
+                        output / "cohort" / "confound",
+                        results / "cohort" / "confound",
+                    )
+                if not any(
+                    _workflow_path(path, "preprocess").is_file()
+                    for path in preprocessing_dirs
+                ):
+                    raise ValueError(
+                        "Cohort preprocessing output is missing. Run "
+                        "preprocessing first."
+                    )
+                confound_ready = any(
+                    _workflow_path(path, "confound_correction").is_file()
+                    and any(
+                        path.is_file()
+                        for path in (
+                            confound_dir
+                            / "confound_correction_datasink"
+                            / "cleaned_timeseries"
+                        ).rglob(
+                            "*_cleaned.nii.gz"
+                        )
+                    )
+                    for confound_dir in confound_dirs
                 )
+                if not confound_ready:
+                    raise ValueError(
+                        "Cohort confound-correction cleaned timeseries are "
+                        "missing. Run confound correction first."
+                    )
             script = generate_cohort_script(
                 bids_dir,
                 results,
@@ -2948,9 +3310,7 @@ class SubjectManager(QMainWindow):
                 fix_species=self.cohort_fix_species_selector.currentText(),
                 subject_prefix=self.path_fields["subject_prefix"].text().strip(),
                 output_dir=output,
-                delete_output_after_archive=(
-                    self.delete_output_after_archive.isChecked()
-                ),
+                archive_outputs=self.archive_outputs.isChecked(),
             )
             script_path = output / "tmp_script" / pipeline / "scrip_cohort.sh"
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3062,8 +3422,8 @@ class SubjectManager(QMainWindow):
             "Submit cohort job",
             f"Submit one {pipeline_label.lower()} job for all "
             f"{len(subject_names)} subject(s) in {bids_dir} with sbatch? "
-            "RABIES reads the original BIDS directory read-only; stage results "
-            "are archived separately.",
+            "RABIES reads the original BIDS directory read-only. The script "
+            "uses the Archiving setting selected when it was created.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirmation != QMessageBox.StandardButton.Yes:
@@ -3272,36 +3632,53 @@ class SubjectManager(QMainWindow):
                             )
                     elif pipeline == "analysis_only":
                         session_results = results / subject / session_name
-                        preprocess_archive = session_results / "preprocess"
-                        input_archive = session_results / "input_bids"
-                        if (
-                            not _workflow_path(
-                                preprocess_archive, "preprocess"
-                            ).is_file()
-                            or not input_archive.is_dir()
-                        ):
+                        if self.archive_outputs.isChecked():
+                            preprocess_sources = (session_results / "preprocess",)
+                            confound_sources = (session_results / "confound",)
+                            input_available = (
+                                session_results / "input_bids"
+                            ).is_dir()
+                        else:
+                            session_output = output / SINGLE_SUBJECT_OUTPUT_DIR
+                            preprocess_sources = (
+                                session_output / "func_preprocess" / subject
+                                / session_name,
+                                session_results / "preprocess",
+                            )
+                            confound_sources = (
+                                session_output / "func_confound" / subject
+                                / session_name,
+                                session_results / "confound",
+                            )
+                            input_available = True
+                        if not any(
+                            _workflow_path(source, "preprocess").is_file()
+                            for source in preprocess_sources
+                        ) or not input_available:
                             raise ValueError(
-                                f"Archived preprocessing and BIDS inputs are "
-                                f"missing for {subject}/{session}. Run a "
+                                f"Preprocessing and BIDS inputs are missing "
+                                f"for {subject}/{session}. Run a "
                                 "preprocessing workflow first."
                             )
-                        cleaned_timeseries = (
-                            session_results
-                            / "confound"
-                            / "confound_correction_datasink"
-                            / "cleaned_timeseries"
-                        )
-                        if not any(
-                            path.is_file()
-                            for path in cleaned_timeseries.rglob(
-                                "*_cleaned.nii.gz"
+                        confound_ready = any(
+                            _workflow_path(
+                                source, "confound_correction"
+                            ).is_file()
+                            and any(
+                                path.is_file()
+                                for path in (
+                                    source
+                                    / "confound_correction_datasink"
+                                    / "cleaned_timeseries"
+                                ).rglob("*_cleaned.nii.gz")
                             )
-                        ):
+                            for source in confound_sources
+                        )
+                        if not confound_ready:
                             raise ValueError(
-                                f"Archived confound cleaned timeseries are "
-                                f"missing for {subject}/{session}: "
-                                f"{cleaned_timeseries}. Run confound correction "
-                                "first and keep its cleaned_timeseries folder intact."
+                                f"Confound cleaned timeseries are missing for "
+                                f"{subject}/{session}. Run confound correction "
+                                "first."
                             )
                     script = generate_subject_script(
                         subject,
@@ -3314,9 +3691,7 @@ class SubjectManager(QMainWindow):
                         preprocess_args=self.stage_args["Preprocessing"],
                         confound_args=self.stage_args["Confound correction"],
                         analysis_args=self.stage_args["Analysis"],
-                        delete_output_after_archive=(
-                            self.delete_output_after_archive.isChecked()
-                        ),
+                        archive_outputs=self.archive_outputs.isChecked(),
                         session=session,
                         pipeline=pipeline,
                         fix_species=self.fix_species_selector.currentText(),

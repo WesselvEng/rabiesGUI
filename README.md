@@ -57,9 +57,9 @@ FIXRABIES and its FSL/FIX dependencies must be available to the job; see the
 
 Scripts are created under
 `<output>/tmp_script/<pipeline>/`. Per-session working data is under
-`<output>/single-subject/`; archived stage results are under
-`<results>/<subject>/<session>/`. Cohort working data and archived results are
-under `<output>/cohort/` and `<results>/cohort/`.
+`<output>/single-subject/`; when archiving is enabled, session results are under
+`<results>/<subject>/<session>/`. Cohort working data and (when enabled)
+archived results are under `<output>/cohort/` and `<results>/cohort/`.
 
 **Submit scripts with sbatch** submits the currently selected pipeline. With no
 session rows selected, eligible sessions for the selected subjects are
@@ -73,12 +73,16 @@ orientation. Use **Reorient selected NIfTIs to RAS** to convert files; originals
 are backed up beside the BIDS folder. Files under `mrs/` are excluded from
 orientation checks and scan counts.
 
-The checked-by-default delete-after-archive option removes working outputs
-after copying results to the archive; it does not delete archived results.
+The checked-by-default **Archiving** option copies stage results to the results
+directory and then removes working outputs. When unchecked, jobs do not archive
+any outputs and retain their working files.
+Use **Archive existing output** to copy existing working outputs for selected
+subjects (or the full cohort) into the results directory without deleting the
+working copies. Existing archived files with matching names may be replaced.
 **Clear ALL results** removes archived results after confirmation. The
 **Move cleaned timeseries** action moves `*_cleaned.nii.gz` files to
-`<results>/cleaned_timeseries/`; analysis-only instead reads the archived
-confound-correction copy.
+`<results>/cleaned_timeseries/`; analysis-only reads the prior confound outputs
+from the working folders when archiving is off, or from the archive when on.
 
 Use **RABIES arguments…** to edit stage CLI arguments before creating scripts.
 For cohort workflows, preprocessing and analysis run across the dataset once.
