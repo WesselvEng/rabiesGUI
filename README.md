@@ -107,6 +107,9 @@ in the results tree; same-name files with different contents are reported as
 conflicts and left untouched.
 
 Use **RABIES arguments…** to edit stage CLI arguments before creating scripts.
+The **Template files** tab lets you browse for individual anatomical template,
+mask, ROI-label, and prior-map files. Leave any field blank to keep that file's
+default under `/templates`; selected files are mounted read-only for the job.
 For cohort workflows, preprocessing and analysis run across the dataset once.
 They use the configured template paths and group analysis options.
 
@@ -127,7 +130,8 @@ templates/
 └── canica_resting_state.nii.gz
 ```
 
-For mouse or custom templates, update the preprocessing arguments
-(`--anat_template`, `--brain_mask`, `--WM_mask`, `--CSF_mask`,
-`--vascular_mask`) and analysis arguments (`--ROI_labels_file`, `--prior_maps`)
-to use paths under `/templates`. Review generated scripts before submission.
+For mouse or custom templates, use the **Template files** tab to select
+replacement files, or update the preprocessing arguments (`--anat_template`,
+`--brain_mask`, `--WM_mask`, `--CSF_mask`, `--vascular_mask`) and analysis
+arguments (`--ROI_labels_file`, `--prior_maps`) to use paths under `/templates`.
+Review generated scripts before submission.

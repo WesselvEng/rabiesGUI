@@ -13,7 +13,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 import nibabel as nib
 from nibabel.filebasedimages import ImageFileError
@@ -72,6 +72,24 @@ FIX_SUBJECTS_FILE = ".rabies_gui_subjects.txt"
 FIX_SPECIES_FILE = ".rabies_gui_species.txt"
 FIX_CREATE_NEW = "__create_new__"
 SINGLE_SUBJECT_OUTPUT_DIR = "single-subject"
+TEMPLATE_FILE_DEFAULTS = {
+    "anat_template": "anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
+    "brain_mask": "anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
+    "WM_mask": "anatomy/SIGMA_InVivo_WM_bin.nii.gz",
+    "CSF_mask": "anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
+    "vascular_mask": "anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
+    "rois": "atlas/SIGMA_Anatomical_Brain_Atlas.nii.gz",
+    "priors": "canica_resting_state.nii.gz",
+}
+TEMPLATE_FILE_LABELS = {
+    "anat_template": "Anatomical template",
+    "brain_mask": "Brain mask",
+    "WM_mask": "White-matter mask",
+    "CSF_mask": "CSF mask",
+    "vascular_mask": "Vascular mask",
+    "rois": "ROI labels",
+    "priors": "Prior maps",
+}
 logger = logging.getLogger("rabies_gui")
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
@@ -1054,6 +1072,28 @@ def _expand_template_paths(arguments: str, templates: dict[str, str]) -> str:
     return arguments
 
 
+def _resolve_template_files(
+    template_files: Mapping[str, str | Path] | None,
+) -> tuple[dict[str, str], list[str]]:
+    templates = {
+        name: f"/templates/{relative_path}"
+        for name, relative_path in TEMPLATE_FILE_DEFAULTS.items()
+    }
+    binds: list[str] = []
+    for name, selected_path in (template_files or {}).items():
+        if name not in TEMPLATE_FILE_DEFAULTS:
+            raise ValueError(f"Unknown template file variable: {name}")
+        host_path = Path(selected_path).expanduser()
+        if not host_path.is_file():
+            raise ValueError(f"Template file does not exist: {host_path}")
+        host_path = host_path.resolve()
+        extension = "".join(host_path.suffixes)
+        container_path = f"/tmp/rabies_gui_custom_{name}{extension}"
+        templates[name] = container_path
+        binds.extend(["-B", f"{host_path}:{container_path}:ro"])
+    return templates, binds
+
+
 def _session_name(path: Path, subject: str) -> str | None:
     """Return a file's BIDS session when it is below the subject directory."""
     for parent in path.parents:
@@ -1096,6 +1136,7 @@ def generate_subject_script(
     fix_species: str = "ratSIGMA",
     fix_dir: Path | None = None,
     archive_outputs: bool = True,
+    template_files: Mapping[str, str | Path] | None = None,
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
@@ -1165,15 +1206,7 @@ def generate_subject_script(
             legacy_session_archive / "input_bids"
         ).is_dir():
             session_archive = legacy_session_archive / "input_bids"
-    templates = {
-        "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
-        "brain_mask": "/templates/anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
-        "WM_mask": "/templates/anatomy/SIGMA_InVivo_WM_bin.nii.gz",
-        "CSF_mask": "/templates/anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
-        "vascular_mask": "/templates/anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
-        "rois": "/templates/atlas/SIGMA_Anatomical_Brain_Atlas.nii.gz",
-        "priors": "/templates/canica_resting_state.nii.gz",
-    }
+    templates, template_binds = _resolve_template_files(template_files)
 
     def bind(host_path: Path, container_path: str, read_only: bool = False) -> str:
         suffix = ":ro" if read_only else ""
@@ -1184,6 +1217,7 @@ def generate_subject_script(
         "-B", bind(bids, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(templates_dir, "/templates", True),
+    ] + template_binds + [
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "4",
         "preprocess",
         "/input_bids/", "/preprocess_outputs/",
@@ -1193,6 +1227,7 @@ def generate_subject_script(
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(confound, "/confound_correction_outputs"),
         "-B", bind(templates_dir, "/templates", True),
+    ] + template_binds + [
         str(rabies_image), "-f", "confound_correction",
         "/preprocess_outputs/", "/confound_correction_outputs/",
     ] + shlex.split(confound_args)
@@ -1227,6 +1262,7 @@ def generate_subject_script(
         ),
         "-B", bind(analysis, "/analysis_outputs"),
         "-B", bind(templates_dir, "/templates", True),
+    ] + template_binds + [
         str(rabies_image), "-f", "-p", "MultiProc", "analysis",
         "/confound_correction_outputs/", "/analysis_outputs/",
     ] + shlex.split(_expand_template_paths(analysis_args, templates))
@@ -1925,6 +1961,7 @@ def generate_cohort_script(
     subject_prefix: str = "sub-",
     output_dir: Path | None = None,
     archive_outputs: bool = True,
+    template_files: Mapping[str, str | Path] | None = None,
 ) -> str:
     """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
@@ -1968,15 +2005,7 @@ def generate_cohort_script(
     confound_archive = cohort_archive / "confound"
     analysis_archive = cohort_archive / "analysis"
     fix_archive = cohort_archive / "fixrabies"
-    templates = {
-        "anat_template": "/templates/anatomy/SIGMA_InVivo_Brain_Template.nii.gz",
-        "brain_mask": "/templates/anatomy/SIGMA_InVivo_Brain_Mask.nii.gz",
-        "WM_mask": "/templates/anatomy/SIGMA_InVivo_WM_bin.nii.gz",
-        "CSF_mask": "/templates/anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
-        "vascular_mask": "/templates/anatomy/SIGMA_InVivo_CSF_bin.nii.gz",
-        "rois": "/templates/atlas/SIGMA_Anatomical_Brain_Atlas.nii.gz",
-        "priors": "/templates/canica_resting_state.nii.gz",
-    }
+    templates, template_binds = _resolve_template_files(template_files)
 
     def bind(host_path: Path, container_path: str, read_only: bool = False) -> str:
         suffix = ":ro" if read_only else ""
@@ -1987,6 +2016,7 @@ def generate_cohort_script(
         "-B", bind(bids_dir, "/input_bids", True),
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(templates_dir, "/templates", True),
+    ] + template_binds + [
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
         "preprocess", "/input_bids/", "/preprocess_outputs/",
     ] + shlex.split(_expand_template_paths(preprocess_args, templates))
@@ -1995,6 +2025,7 @@ def generate_cohort_script(
         "-B", bind(preprocess, "/preprocess_outputs"),
         "-B", bind(confound, "/confound_correction_outputs"),
         "-B", bind(templates_dir, "/templates", True),
+    ] + template_binds + [
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
         "confound_correction",
         "/preprocess_outputs/", "/confound_correction_outputs/",
@@ -2017,6 +2048,7 @@ def generate_cohort_script(
         ),
         "-B", bind(analysis, "/analysis_outputs"),
         "-B", bind(templates_dir, "/templates", True),
+    ] + template_binds + [
         str(rabies_image), "-f", "-p", "MultiProc", "--local_threads", "8",
         "analysis", "/confound_correction_outputs/", "/analysis_outputs/",
     ] + shlex.split(_expand_template_paths(analysis_args, templates))
@@ -2539,6 +2571,7 @@ class SubjectManager(QMainWindow):
             "Confound correction": CONFOUND_ARGS,
             "Analysis": ANALYSIS_ARGS,
         }
+        self.template_files: dict[str, str] = {}
         self._archive_thread: QThread | None = None
         self._archive_worker: ArchiveWorker | None = None
         self._build_ui()
@@ -3205,7 +3238,7 @@ class SubjectManager(QMainWindow):
     def edit_arguments(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("RABIES stage arguments")
-        dialog.resize(780, 560)
+        dialog.resize(850, 600)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(
             "Enter stage options as command-line arguments, without the stage name "
@@ -3219,6 +3252,34 @@ class SubjectManager(QMainWindow):
             editor.setTabStopDistance(32)
             editors[stage] = editor
             tabs.addTab(editor, stage)
+
+        template_page = QWidget()
+        template_layout = QVBoxLayout(template_page)
+        template_layout.addWidget(QLabel(
+            "Choose replacement files for template variables. Leave a field blank "
+            "to use the default file from the selected template folder."
+        ))
+        template_form = QFormLayout()
+        template_editors: dict[str, QLineEdit] = {}
+        for name, relative_path in TEMPLATE_FILE_DEFAULTS.items():
+            field = QLineEdit(self.template_files.get(name, ""))
+            field.setPlaceholderText(f"Default: /templates/{relative_path}")
+            template_editors[name] = field
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(field)
+            browse = QPushButton("Browse…")
+            browse.clicked.connect(
+                lambda _checked=False, key=name, target=field: (
+                    self._browse_template_file(dialog, key, target)
+                )
+            )
+            row_layout.addWidget(browse)
+            template_form.addRow(TEMPLATE_FILE_LABELS[name], row)
+        template_layout.addLayout(template_form)
+        template_layout.addStretch()
+        tabs.addTab(template_page, "Template files")
         layout.addWidget(tabs, 1)
 
         buttons = QDialogButtonBox(
@@ -3233,7 +3294,28 @@ class SubjectManager(QMainWindow):
                 stage: editor.toPlainText().strip()
                 for stage, editor in editors.items()
             }
+            self.template_files = {
+                name: field.text().strip()
+                for name, field in template_editors.items()
+                if field.text().strip()
+            }
             self.status.setText("RABIES arguments updated for future script generation.")
+
+    def _browse_template_file(
+        self, dialog: QDialog, name: str, field: QLineEdit
+    ) -> None:
+        initial_path = (
+            field.text().strip()
+            or self.path_fields["templates"].text().strip()
+        )
+        selected, _ = QFileDialog.getOpenFileName(
+            dialog,
+            f"Select {TEMPLATE_FILE_LABELS[name]}",
+            initial_path,
+            "NIfTI files (*.nii *.nii.gz);;All files (*)",
+        )
+        if selected:
+            field.setText(selected)
 
     def remove_scripts(self) -> None:
         selected = self._selected_subjects()
@@ -3817,6 +3899,7 @@ class SubjectManager(QMainWindow):
                 subject_prefix=self.path_fields["subject_prefix"].text().strip(),
                 output_dir=output,
                 archive_outputs=self.archive_outputs.isChecked(),
+                template_files=self.template_files,
             )
             script_path = output / "tmp_script" / pipeline / "scrip_cohort.sh"
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4235,6 +4318,7 @@ class SubjectManager(QMainWindow):
                         pipeline=pipeline,
                         fix_species=self.fix_species_selector.currentText(),
                         fix_dir=fix_dir,
+                        template_files=self.template_files,
                     )
                     scripts.append((
                         script_dir / pipeline / f"scrip_{subject}_{session_name}.sh",
