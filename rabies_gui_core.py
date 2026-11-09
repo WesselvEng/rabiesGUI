@@ -89,8 +89,8 @@ ANALYSIS_ARGS = (
     "--data_diagnosis --prior_maps {priors} --FC_matrix "
     "--ROI_labels_file {rois} --DR_ICA "
     "--group_ica apply=true,dim=10,random_seed=1 "
-    "--prior_bold_idx 0 1 3 5 7 8 9 10 11 15 17 18 "
-    "--prior_confound_idx 2 4 6 12 13 14 16 19"
+    "--prior_bold_idx 0 1 3 5 7 8 9 10 11 15 17 18 19"
+    "--prior_confound_idx 2 4 6 12 13 14 16"
 )
 
 DARK_STYLE = """
