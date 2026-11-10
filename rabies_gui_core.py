@@ -48,7 +48,8 @@ from PySide6.QtWidgets import (
 
 
 DEFAULT_RABIES_IMAGE = ""
-DEFAULT_TEMPLATES = ""
+RABIES_IMAGE_ROOT = Path("/opt/rabies")
+TEMPLATE_ROOT = Path("/project/4180000.74/templates")
 SPLASH_IMAGE = Path(__file__).with_name("RABIES-RABIES.png")
 NORMAL_PIPELINE_VARIANTS = (
     ("Preprocessing only", "preproc_only"),
@@ -91,6 +92,45 @@ TEMPLATE_FILE_LABELS = {
     "priors": "Prior maps",
 }
 logger = logging.getLogger("rabies_gui")
+
+
+def latest_rabies_image(image_root: Path = RABIES_IMAGE_ROOT) -> Path | None:
+    """Find the RABIES image in the highest numeric version directory."""
+    if not image_root.is_dir():
+        return None
+    try:
+        images = []
+        for version_dir in image_root.iterdir():
+            if not version_dir.is_dir():
+                continue
+            components = version_dir.name.split(".")
+            if not components or any(not component.isdigit() for component in components):
+                continue
+            image = version_dir / "rabies.sif"
+            if image.is_file():
+                images.append((tuple(int(part) for part in components), image))
+    except OSError as error:
+        logger.warning("Could not read RABIES image directory %s: %s", image_root, error)
+        return None
+    return max(images, key=lambda item: item[0])[1] if images else None
+
+
+def discover_template_folders(template_root: Path = TEMPLATE_ROOT) -> list[Path]:
+    """Return the immediate template directories available for selection."""
+    try:
+        return sorted(
+            (path for path in template_root.iterdir() if path.is_dir()),
+            key=lambda path: path.name.casefold(),
+        )
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        logger.warning(
+            "Could not read template directory %s: %s", template_root, error
+        )
+        return []
+
+
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
@@ -2326,6 +2366,7 @@ class ProjectSetupWindow(QMainWindow):
         self.setMinimumSize(720, 380)
         self.path_fields: dict[str, QLineEdit] = {}
         self.subject_manager: SubjectManager | None = None
+        self._project_defaults_root: Path | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -2342,7 +2383,6 @@ class ProjectSetupWindow(QMainWindow):
             ("Project root", "root", str(Path.cwd())),
             ("Output directory", "output", ""),
             ("Results directory", "results", ""),
-            ("Template folder (rat, mouse, or custom)", "templates", DEFAULT_TEMPLATES),
             ("RABIES image", "image", DEFAULT_RABIES_IMAGE),
             ("Subject folder prefix", "subject_prefix", "sub-"),
         )
@@ -2360,6 +2400,31 @@ class ProjectSetupWindow(QMainWindow):
                 browse.clicked.connect(lambda _checked=False, item=key: self._browse(item))
                 row_layout.addWidget(browse)
             path_layout.addRow(label, row_widget)
+
+        template_path = QLineEdit()
+        self.path_fields["templates"] = template_path
+        self.template_folders = QComboBox()
+        self.template_folders.currentIndexChanged.connect(
+            self._select_template_folder
+        )
+        template_widget = QWidget()
+        template_layout = QHBoxLayout(template_widget)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        template_layout.addWidget(self.template_folders)
+        browse_templates = QPushButton("Browse…")
+        browse_templates.clicked.connect(self._browse_template_folder)
+        template_layout.addWidget(browse_templates)
+        path_layout.addRow("Template folder (rat, mouse, or custom)", template_widget)
+
+        latest_image = latest_rabies_image()
+        image_field = self.path_fields["image"]
+        if latest_image is not None:
+            image_field.setText(str(latest_image))
+        else:
+            image_field.setPlaceholderText(
+                f"No versioned rabies.sif found under {RABIES_IMAGE_ROOT}; "
+                "browse to select an image."
+            )
 
         self.bids_folders = QComboBox()
         self.bids_folders.addItem("Select a folder containing sub-* subjects", None)
@@ -2387,8 +2452,55 @@ class ProjectSetupWindow(QMainWindow):
         layout.addWidget(self.status)
         self.path_fields["root"].textChanged.connect(self._populate_bids_folders)
         self.path_fields["root"].editingFinished.connect(self._update_project_output_defaults)
+        self._populate_template_folders()
         self._update_project_output_defaults()
         self._populate_bids_folders()
+
+    def _populate_template_folders(self) -> None:
+        selected_path = self.path_fields["templates"].text().strip()
+        self.template_folders.clear()
+        folders = discover_template_folders()
+        placeholder = (
+            "Select a template folder"
+            if folders
+            else f"No template folders found in {TEMPLATE_ROOT}"
+        )
+        self.template_folders.addItem(placeholder, None)
+        for folder in folders:
+            self.template_folders.addItem(folder.name, str(folder))
+        selected_index = self.template_folders.findData(selected_path)
+        if selected_index < 0 and selected_path:
+            self.template_folders.addItem(
+                f"Custom: {Path(selected_path).name}", selected_path
+            )
+            selected_index = self.template_folders.count() - 1
+        self.template_folders.setCurrentIndex(max(selected_index, 0))
+        self._select_template_folder(self.template_folders.currentIndex())
+
+    def _select_template_folder(self, index: int) -> None:
+        selected_path = self.template_folders.itemData(index)
+        self.path_fields["templates"].setText(selected_path or "")
+
+    def _browse_template_folder(self) -> None:
+        current_value = self.path_fields["templates"].text().strip()
+        current_path = (
+            Path(current_value).expanduser()
+            if current_value
+            else TEMPLATE_ROOT
+        )
+        selected = QFileDialog.getExistingDirectory(
+            self, "Select template directory", str(current_path)
+        )
+        if not selected:
+            return
+        selected_path = str(Path(selected))
+        selected_index = self.template_folders.findData(selected_path)
+        if selected_index < 0:
+            self.template_folders.addItem(
+                f"Custom: {Path(selected_path).name}", selected_path
+            )
+            selected_index = self.template_folders.count() - 1
+        self.template_folders.setCurrentIndex(selected_index)
 
     def _browse(self, key: str) -> None:
         if key == "image":
@@ -2502,8 +2614,21 @@ class ProjectSetupWindow(QMainWindow):
         if not root_value:
             return
         root = Path(root_value).expanduser()
-        self.path_fields["output"].setText(str(root / "rabies_outputs"))
-        self.path_fields["results"].setText(str(root / "rabies_results"))
+        for key, directory_name in (
+            ("output", "rabies_outputs"),
+            ("results", "rabies_results"),
+        ):
+            field = self.path_fields[key]
+            current_value = field.text().strip()
+            matches_previous_default = (
+                bool(current_value)
+                and self._project_defaults_root is not None
+                and Path(current_value).expanduser().resolve()
+                == (self._project_defaults_root / directory_name).resolve()
+            )
+            if not current_value or matches_previous_default:
+                field.setText(str(root / directory_name))
+        self._project_defaults_root = root
 
     def _project_paths(self) -> tuple[Path, Path, Path, Path, Path]:
         root_value = self.path_fields["root"].text().strip()

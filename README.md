@@ -33,11 +33,17 @@ SLURM submission also requires `sbatch`.
 
 ## Configure and choose a workflow
 
-In Project Setup, select the project root, original BIDS folder, RABIES
-Apptainer image, template folder, output directory, and results directory.
+In Project Setup, select the project root, original BIDS folder, output
+directory, and results directory. The GUI automatically selects the
+highest-numbered RABIES image version containing `rabies.sif` under
+`/opt/rabies/`; use Browse to override it. The template dropdown lists
+directories found under `/project/4180000.74/templates/`; use Browse to select
+a template folder elsewhere.
 Choosing a project root defaults the latter paths to `rabies_outputs/` and
-`rabies_results/`. The subject prefix defaults to `sub-`. The GUI may discover
-a BIDS folder automatically when launched from a project containing `bids/`.
+`rabies_results/`. Changing the project root updates those paths only while
+they still use their defaults; manually selected output and results paths are
+preserved. The subject prefix defaults to `sub-`. The GUI may discover a BIDS
+folder automatically when launched from a project containing `bids/`.
 
 In the analysis manager, choose **Single-subject/session** to create independent
 jobs for selected subject sessions, or **Cohort** for one job across the BIDS
