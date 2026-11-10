@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 DEFAULT_RABIES_IMAGE = ""
 RABIES_IMAGE_ROOT = Path("/opt/rabies")
-TEMPLATE_ROOT = Path("/project/4180000.74/templates")
+TEMPLATE_ROOT = Path("/project/4180000.74/wessel/templates")
 SPLASH_IMAGE = Path(__file__).with_name("RABIES-RABIES.png")
 NORMAL_PIPELINE_VARIANTS = (
     ("Preprocessing only", "preproc_only"),
