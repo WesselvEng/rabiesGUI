@@ -150,6 +150,7 @@ ANALYSIS_ARGS = (
     "--prior_bold_idx 0 1 3 5 7 8 9 10 11 15 17 18 19"
     "--prior_confound_idx 2 4 6 12 13 14 16"
 )
+FIXRABIES_ARGS = "-nipype {nipype}"
 
 DARK_STYLE = """
 QWidget {
@@ -1177,6 +1178,7 @@ def generate_subject_script(
     fix_dir: Path | None = None,
     archive_outputs: bool = True,
     template_files: Mapping[str, str | Path] | None = None,
+    fixrabies_args: str = FIXRABIES_ARGS,
 ) -> str:
     """Build a resumable Bash job for exactly one subject session."""
     if not bold_files:
@@ -1311,6 +1313,15 @@ def generate_subject_script(
     fix_scan_check = None
     if pipeline in {"fixrabies_prepare", "fixrabies_prepare_only"}:
         assert fix_dir is not None
+        fix_args = shlex.split(_expand_template_paths(
+            fixrabies_args,
+            {
+                **templates,
+                "nipype": shlex.quote(
+                    '{"plugin":"MultiProc","n_procs":4}'
+                ),
+            },
+        ))
         fix_prepare_command = " ".join([
             "fixrabies",
             "prepare",
@@ -1320,9 +1331,7 @@ def generate_subject_script(
             shlex.quote(str(fix_dir)),
             "-species",
             shlex.quote(fix_species),
-            "-nipype",
-            shlex.quote('{"plugin":"MultiProc","n_procs":4}'),
-        ])
+        ] + ([shlex.join(fix_args)] if fix_args else []))
         fix_marker = fix_dir / ".rabies_gui_prepared" / f"{subject}_{session_name}.done"
         scan_prefix = (
             subject if session_name == "no-session"
@@ -2002,6 +2011,7 @@ def generate_cohort_script(
     output_dir: Path | None = None,
     archive_outputs: bool = True,
     template_files: Mapping[str, str | Path] | None = None,
+    fixrabies_args: str = FIXRABIES_ARGS,
 ) -> str:
     """Build one resumable RABIES or FIXRABIES job for a BIDS dataset."""
     bids_dir = bids_dir.expanduser().resolve()
@@ -2097,8 +2107,15 @@ def generate_cohort_script(
         "-preprocess_dir", str(preprocess),
         "-fix_dir", str(fix_dir),
         "-species", fix_species,
-        "-nipype", '{"plugin":"MultiProc","n_procs":8}',
-    ]
+    ] + shlex.split(_expand_template_paths(
+        fixrabies_args,
+        {
+            **templates,
+            "nipype": shlex.quote(
+                '{"plugin":"MultiProc","n_procs":8}'
+            ),
+        },
+    ))
 
     preprocess_workflow = _workflow_path(preprocess, "preprocess")
     archived_preprocess_workflow = _workflow_path(preprocess_archive, "preprocess")
@@ -2695,6 +2712,7 @@ class SubjectManager(QMainWindow):
             "Preprocessing": PREPROCESS_ARGS,
             "Confound correction": CONFOUND_ARGS,
             "Analysis": ANALYSIS_ARGS,
+            "FIXRABIES prepare": FIXRABIES_ARGS,
         }
         self.template_files: dict[str, str] = {}
         self._archive_thread: QThread | None = None
@@ -2825,7 +2843,7 @@ class SubjectManager(QMainWindow):
             ("Clear selection", self.clear_selection),
             ("Move cleaned timeseries", self.move_selected_cleaned_timeseries),
             ("Reorient selected NIfTIs to RAS", self.reorient_selected_niftis),
-            ("RABIES arguments…", self.edit_arguments),
+            ("Pipeline arguments…", self.edit_arguments),
         ):
             button = QPushButton(label)
             button.clicked.connect(callback)
@@ -3362,12 +3380,12 @@ class SubjectManager(QMainWindow):
 
     def edit_arguments(self) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("RABIES stage arguments")
+        dialog.setWindowTitle("Pipeline arguments")
         dialog.resize(850, 600)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(
-            "Enter stage options as command-line arguments, without the stage name "
-            "or input/output paths. Use the RABIES CLI help as a reference."
+            "Enter command-line options without the command or managed input/output "
+            "paths. Use the RABIES or FIXRABIES CLI help as a reference."
         ))
 
         tabs = QTabWidget()
@@ -3375,6 +3393,10 @@ class SubjectManager(QMainWindow):
         for stage, arguments in self.stage_args.items():
             editor = QPlainTextEdit(arguments)
             editor.setTabStopDistance(32)
+            if stage == "FIXRABIES prepare":
+                editor.setToolTip(
+                    "{nipype} expands to the mode's default Nipype configuration."
+                )
             editors[stage] = editor
             tabs.addTab(editor, stage)
 
@@ -3424,7 +3446,9 @@ class SubjectManager(QMainWindow):
                 for name, field in template_editors.items()
                 if field.text().strip()
             }
-            self.status.setText("RABIES arguments updated for future script generation.")
+            self.status.setText(
+                "Pipeline arguments updated for future script generation."
+            )
 
     def _browse_template_file(
         self, dialog: QDialog, name: str, field: QLineEdit
@@ -4019,6 +4043,7 @@ class SubjectManager(QMainWindow):
                 preprocess_args=self.stage_args["Preprocessing"],
                 confound_args=self.stage_args["Confound correction"],
                 analysis_args=self.stage_args["Analysis"],
+                fixrabies_args=self.stage_args["FIXRABIES prepare"],
                 pipeline=pipeline,
                 fix_species=self.cohort_fix_species_selector.currentText(),
                 subject_prefix=self.path_fields["subject_prefix"].text().strip(),
@@ -4438,6 +4463,7 @@ class SubjectManager(QMainWindow):
                         preprocess_args=self.stage_args["Preprocessing"],
                         confound_args=self.stage_args["Confound correction"],
                         analysis_args=self.stage_args["Analysis"],
+                        fixrabies_args=self.stage_args["FIXRABIES prepare"],
                         archive_outputs=self.archive_outputs.isChecked(),
                         session=session,
                         pipeline=pipeline,

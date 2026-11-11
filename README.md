@@ -112,7 +112,11 @@ Identical source duplicates are removed after the move so only one copy remains
 in the results tree; same-name files with different contents are reported as
 conflicts and left untouched.
 
-Use **RABIES arguments…** to edit stage CLI arguments before creating scripts.
+Use **Pipeline arguments…** to edit stage CLI arguments before creating scripts.
+The **FIXRABIES prepare** tab customizes additional `fixrabies prepare` options;
+the GUI supplies the preprocessing directory, FIX folder, and species from the
+selected workflow controls. Its `{nipype}` default retains the mode-specific
+Nipype process count and can be replaced with other FIXRABIES options.
 The **Template files** tab lets you browse for individual anatomical template,
 mask, ROI-label, and prior-map files. Leave any field blank to keep that file's
 default under `/templates`; selected files are mounted read-only for the job.
