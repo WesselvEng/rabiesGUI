@@ -60,6 +60,10 @@ Analysis-only reads archived confound-correction outputs and requires the
 running analysis-only. FIX prepare-only requires existing preprocessing output.
 FIXRABIES and its FSL/FIX dependencies must be available to the job; see the
 [FIXRABIES installation instructions](https://github.com/grandjeanlab/FixRABIES#installation).
+FIXRABIES prepare jobs use matching Nipype and SLURM memory budgets. Single-
+subject jobs and cohort FIX prepare-only jobs request 8 GB; combined cohort
+preprocessing + FIX jobs request 64 GB for both to cover cohort-wide RABIES
+preprocessing.
 
 ## Outputs and job controls
 

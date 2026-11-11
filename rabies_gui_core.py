@@ -64,6 +64,8 @@ FIX_PIPELINE_VARIANTS = (
 PIPELINE_VARIANTS = NORMAL_PIPELINE_VARIANTS + FIX_PIPELINE_VARIANTS
 COHORT_PIPELINE_VARIANTS = PIPELINE_VARIANTS
 FIXRABIES_SPECIES = ("ratSIGMA", "mouseDSURQE", "mouseAIBS")
+FIXRABIES_MEMORY_GB = 8
+COHORT_MEMORY_GB = 64
 COHORT_ANALYSIS_ARCHIVE_DIRS = (
     "commonspace_analysis_datasink",
     "data_diagnosis_datasink",
@@ -1318,7 +1320,8 @@ def generate_subject_script(
             {
                 **templates,
                 "nipype": shlex.quote(
-                    '{"plugin":"MultiProc","n_procs":4}'
+                    f'{{"plugin":"MultiProc","n_procs":4,'
+                    f'"memory_gb":{FIXRABIES_MEMORY_GB}}}'
                 ),
             },
         ))
@@ -1354,7 +1357,7 @@ def generate_subject_script(
     lines = [
         "#!/usr/bin/env bash",
         "#SBATCH --time=12:00:00",
-        f"#SBATCH --mem={'4G' if pipeline == 'fixrabies_prepare_only' else '8G'}",
+        f"#SBATCH --mem={FIXRABIES_MEMORY_GB}G",
         "#SBATCH --cpus-per-task=4",
         "set -euo pipefail",
         f"subject={shlex.quote(subject)}",
@@ -2056,6 +2059,11 @@ def generate_cohort_script(
     analysis_archive = cohort_archive / "analysis"
     fix_archive = cohort_archive / "fixrabies"
     templates, template_binds = _resolve_template_files(template_files)
+    fix_nipype_memory_gb = (
+        COHORT_MEMORY_GB
+        if pipeline == "fixrabies_prepare"
+        else FIXRABIES_MEMORY_GB
+    )
 
     def bind(host_path: Path, container_path: str, read_only: bool = False) -> str:
         suffix = ":ro" if read_only else ""
@@ -2112,7 +2120,8 @@ def generate_cohort_script(
         {
             **templates,
             "nipype": shlex.quote(
-                '{"plugin":"MultiProc","n_procs":8}'
+                f'{{"plugin":"MultiProc","n_procs":8,'
+                f'"memory_gb":{fix_nipype_memory_gb}}}'
             ),
         },
     ))
@@ -2130,7 +2139,11 @@ def generate_cohort_script(
         "#SBATCH --time=48:00:00",
         "#SBATCH --nodes=1",
         "#SBATCH --ntasks=1",
-        "#SBATCH --mem=64G",
+        (
+            f"#SBATCH --mem={FIXRABIES_MEMORY_GB}G"
+            if pipeline == "fixrabies_prepare_only"
+            else f"#SBATCH --mem={COHORT_MEMORY_GB}G"
+        ),
         "#SBATCH --cpus-per-task=32",
         "set -euo pipefail",
         f"cohort={shlex.quote(str(cohort_output))}",
