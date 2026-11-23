@@ -149,3 +149,16 @@ replacement files, or update the preprocessing arguments (`--anat_template`,
 `--brain_mask`, `--WM_mask`, `--CSF_mask`, `--vascular_mask`) and analysis
 arguments (`--ROI_labels_file`, `--prior_maps`) to use paths under `/templates`.
 Review generated scripts before submission.
+
+## RABIES 0.6.4 compatibility
+
+The default preprocessing arguments are compatible with RABIES 0.6.4; the
+obsolete preprocessing `--TR` option is intentionally omitted. The confound
+correction default still supplies `--TR`, which remains part of that stage.
+When upgrading custom pipeline arguments from 0.6.3, replace `--detect_dummy`
+with `--remove_dummy`, replace `--apply_despiking` with the configurable
+`--despiking` option, and remove preprocessing-stage `--TR`. `--log_transform`
+still works as a bare flag and now also transforms the anatomical template by
+default; set `template=false` when it is already log-transformed. Log
+transformation requires `--data_type float32`. Existing generated job scripts
+should be regenerated after updating any legacy arguments.

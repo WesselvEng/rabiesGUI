@@ -136,7 +136,7 @@ def discover_template_folders(template_root: Path = TEMPLATE_ROOT) -> list[Path]
 PREPROCESS_ARGS = (
     "--anat_template {anat_template} --brain_mask {brain_mask} "
     "--WM_mask {WM_mask} --CSF_mask {CSF_mask} "
-    "--vascular_mask {vascular_mask} --TR 1 "
+    "--vascular_mask {vascular_mask} "
     "--commonspace_reg masking=false,brain_extraction=false,"
     "template_registration=SyN,fast_commonspace=false "
     "--commonspace_resampling 0.3x0.3x0.3"
